@@ -1,5 +1,6 @@
 mod abi;
 mod backport;
+mod backport_sem;
 mod bloblogs;
 mod boot;
 mod buildguard;
@@ -44,21 +45,25 @@ MERGE & CONFLICT TRIAGE:
                                        default: full dossier (incoming WHY, Fixes: revert check, local
                                        divergence, 3-way :1:..:3: upstream intent, missing-symbol audit)
   dup-check [files...]                 16-core 3-way test: ALREADY-IN-HEAD vs CONTEXT-ONLY vs REAL-CONFLICT
-  backport-check <repo.git> [--apply-clean] [--no-doc] <shas...|@file>
+  backport-check <repo.git> [--apply-clean] [--no-doc] [--deep] <shas...|@file>
                                        16-core scanner (IN-LOG/ALREADY/ALREADY-CODE/CLEAN/CLEAN-NODOC/ADAPT)
-                                       with [BUILT]/[ACK]/[CLO], MOVED-FN, NO-FN & SERIES-DEP detection
-  backport-apply <repo.git> [--no-doc] [--no-sign] [--stop-on-conflict] <shas...|@file>
+                                       with [BUILT]/[ACK]/[CLO], MOVED-FN, NO-FN, SERIES-DEP & --deep semantic flags
+  backport-series <repo.git> <shas...|@file>
+                                       topological upstream order + series gap finder + semantic risk dashboard
+                                       ([API-DRIFT]/[UNDEF]/[ATOMIC-SLEEP]/[EXTRA-CALLER]/[STRUCT-MOD])
+  backport-apply <repo.git> [--no-doc] [--no-sign] [--check] [--stop-on-conflict] <shas...|@file>
                                        sequential GPG-signed batch applier (auto-skips ALREADY-CODE,
-                                       strips doc-only conflicts, appends upstream SHA footer)
+                                       strips doc-only conflicts, --check runs fast clang -fsyntax-only per commit)
   backport-ctx   <repo.git> [--ctx N] [--all-hunks] [--doc] <shas...|@file>
-                                       token-saving surgical conflict inspector: collapses clean/dup hunks,
-                                       locates moved funcs, surfaces prereqs, vendor hooks & missing symbols
+                                       token-saving semantic conflict dossier: collapses clean/dup hunks,
+                                       detects API arity drift, atomic-sleep traps, extra unpatched callers,
+                                       upstream series gaps, struct impact, vendor hooks & auto-fetches missing defs
   backport-stage <repo.git> <sha> [--ctx N] [--doc]
                                        apply all clean hunks into working tree, skip dups, and print ONLY
-                                       remaining conflict hunks + local lines + prereq hints to hand-edit
-  backport-commit <repo.git> <sha> [--no-sign] [--allow-hook-drop] [-- <files...>]
+                                       remaining conflict hunks + semantic dossier to hand-edit
+  backport-commit <repo.git> <sha> [--no-sign] [--check] [--allow-hook-drop] [-- <files...>]
                                        1-line GPG-signed BACKPORT commit preserving upstream author/date/SHA
-                                       with built-in vendor-hook / EXPORT_SYMBOL deletion guard
+                                       with vendor-hook/EXPORT_SYMBOL guard & --check fast clang compile gate
   backport-search <repo.git> <pattern> [--range R] [-n N] [-- <paths...>]
                                        find upstream commits matching pattern, deduplicated vs local HEAD
   why       <sym|sha|file:L[-E]> [paths...] [-n N]
@@ -325,39 +330,55 @@ fn main() {
         "backport-check" => {
             let mut apply_clean = false;
             let mut no_doc = false;
+            let mut deep = false;
             let mut pos: Vec<String> = Vec::new();
             for a in args {
                 match a.as_str() {
                     "--apply-clean" => apply_clean = true,
                     "--no-doc" => no_doc = true,
+                    "--deep" => deep = true,
                     _ => pos.push(a.clone()),
                 }
             }
             if pos.len() < 2 {
-                eprintln!("usage: kawal backport-check <upstream.git> [--apply-clean] [--no-doc] <shas...|@file>");
+                eprintln!("usage: kawal backport-check <upstream.git> [--apply-clean] [--no-doc] [--deep] <shas...|@file>");
                 2
             } else {
-                backport::cmd_backport_check(&ctx, &pos[0], &pos[1..], apply_clean, no_doc)
+                backport::cmd_backport_check(&ctx, &pos[0], &pos[1..], apply_clean, no_doc, deep)
+            }
+        }
+        "backport-series" => {
+            let mut pos: Vec<String> = Vec::new();
+            for a in args {
+                pos.push(a.clone());
+            }
+            if pos.len() < 2 {
+                eprintln!("usage: kawal backport-series <upstream.git> <shas...|@file>");
+                2
+            } else {
+                backport::cmd_backport_series(&ctx, &pos[0], &pos[1..])
             }
         }
         "backport-apply" => {
             let mut no_doc = false;
             let mut sign = true;
+            let mut compile_check = false;
             let mut stop_on_conflict = false;
             let mut pos: Vec<String> = Vec::new();
             for a in args {
                 match a.as_str() {
                     "--no-doc" => no_doc = true,
                     "--no-sign" => sign = false,
+                    "--check" => compile_check = true,
                     "--stop-on-conflict" => stop_on_conflict = true,
                     _ => pos.push(a.clone()),
                 }
             }
             if pos.len() < 2 {
-                eprintln!("usage: kawal backport-apply <upstream.git> [--no-doc] [--no-sign] [--stop-on-conflict] <shas...|@file>");
+                eprintln!("usage: kawal backport-apply <upstream.git> [--no-doc] [--no-sign] [--check] [--stop-on-conflict] <shas...|@file>");
                 2
             } else {
-                backport::cmd_backport_apply(&ctx, &pos[0], &pos[1..], no_doc, sign, stop_on_conflict)
+                backport::cmd_backport_apply(&ctx, &pos[0], &pos[1..], no_doc, sign, compile_check, stop_on_conflict)
             }
         }
         "backport-ctx" | "backport-stage" => {
@@ -388,6 +409,7 @@ fn main() {
         }
         "backport-commit" => {
             let mut sign = true;
+            let mut compile_check = false;
             let mut allow_hook_drop = false;
             let mut pos: Vec<String> = Vec::new();
             let mut files: Vec<String> = Vec::new();
@@ -399,6 +421,8 @@ fn main() {
                     in_files = true;
                 } else if a == "--no-sign" {
                     sign = false;
+                } else if a == "--check" {
+                    compile_check = true;
                 } else if a == "--allow-hook-drop" {
                     allow_hook_drop = true;
                 } else {
@@ -406,13 +430,13 @@ fn main() {
                 }
             }
             if pos.len() < 2 {
-                eprintln!("usage: kawal backport-commit <upstream.git> <sha> [--no-sign] [--allow-hook-drop] [-- <files...>]");
+                eprintln!("usage: kawal backport-commit <upstream.git> <sha> [--no-sign] [--check] [--allow-hook-drop] [-- <files...>]");
                 2
             } else {
                 if pos.len() > 2 && files.is_empty() {
                     files.extend(pos[2..].iter().cloned());
                 }
-                backport::cmd_backport_commit(&ctx, &pos[0], &pos[1], &files, sign, allow_hook_drop)
+                backport::cmd_backport_commit(&ctx, &pos[0], &pos[1], &files, sign, compile_check, allow_hook_drop)
             }
         }
         "backport-search" => {

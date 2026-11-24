@@ -255,7 +255,12 @@ fn find_sibling_ocmd(ctx: &Ctx, rel_c: &str, kbuild_cache: &mut HashMap<String, 
     let tp = buildguard::techpack_root(rel_c);
     let tp_dir = if tp.is_empty() { ctx.repo.clone() } else { ctx.repo.join(&tp) };
 
-    let kb = kbuild_cache.entry(tp.clone()).or_insert_with(|| {
+    let cache_key = p
+        .parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_else(|| tp.clone());
+
+    let kb = kbuild_cache.entry(cache_key).or_insert_with(|| {
         let mut s = String::new();
         for cand in ["Kbuild", "Makefile", "msm/Kbuild", "drivers/Kbuild"] {
             if let Ok(t) = fs::read_to_string(tp_dir.join(cand)) {
@@ -263,13 +268,20 @@ fn find_sibling_ocmd(ctx: &Ctx, rel_c: &str, kbuild_cache: &mut HashMap<String, 
                 s.push('\n');
             }
         }
-        if let Some(par) = p.parent() {
+        // Walk up to 3 parent directories (e.g. lib/zstd/compress/ -> lib/zstd/Makefile)
+        let mut cur_dir = p.parent();
+        for _ in 0..3 {
+            let Some(par) = cur_dir else { break };
             for cand in ["Kbuild", "Makefile"] {
                 if let Ok(t) = fs::read_to_string(ctx.repo.join(par).join(cand)) {
                     s.push_str(&t);
                     s.push('\n');
                 }
             }
+            if par.as_os_str().is_empty() {
+                break;
+            }
+            cur_dir = par.parent();
         }
         s
     });
@@ -806,6 +818,64 @@ pub fn cmd_preflight(
     }
 
     if compile_ok && link_ok && !guard_failed { 0 } else { 1 }
+}
+
+/// Lightweight real `clang -fsyntax-only` check on a small set of `.c` files (used by
+/// `backport-apply --check` and `backport-commit --check`). Returns `(checked_count, errors)`.
+pub fn quick_syntax_check(ctx: &Ctx, rel_files: &[String]) -> (usize, Vec<(String, Vec<String>)>) {
+    if !ctx.kernel_obj.is_dir() {
+        return (0, Vec::new());
+    }
+    let clang = detect_clang_bin(ctx);
+    let mut jobs: Vec<(String, PathBuf, PathBuf, Option<PathBuf>)> = Vec::new();
+    let mut kbuild_cache: HashMap<String, String> = HashMap::new();
+    let mut seen = HashSet::new();
+
+    for f in rel_files {
+        if !f.ends_with(".c") || !seen.insert(f.clone()) || !ctx.repo.join(f).is_file() {
+            continue;
+        }
+        let found = if ctx.is_modules_repo {
+            find_ocmd_for_module_c(ctx, f)
+        } else {
+            find_ocmd_for_kernel_c(ctx, f)
+        };
+        if let Some((ocmd, cwd)) = found {
+            jobs.push((f.clone(), ocmd, cwd, None));
+        } else if let Some((sib_ocmd, cwd, abs_src)) = find_sibling_ocmd(ctx, f, &mut kbuild_cache) {
+            jobs.push((f.clone(), sib_ocmd, cwd, Some(abs_src)));
+        }
+    }
+    if jobs.is_empty() {
+        return (0, Vec::new());
+    }
+
+    let checked = jobs.len();
+    let res: Vec<(String, i32, String)> = par_map(&jobs, ctx.threads, |(label, ocmd, cwd, ov)| {
+        let Ok(txt) = fs::read_to_string(ocmd) else {
+            return (label.clone(), 0, String::new());
+        };
+        let Some(args) = parse_ocmd_to_clang_args(&txt, None, ov.as_deref(), &[]) else {
+            return (label.clone(), 0, String::new());
+        };
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (rc, _, err) = run_cmd(&clang, &arg_refs, cwd, None);
+        (label.clone(), rc, err)
+    });
+
+    let mut errs = Vec::new();
+    for (label, rc, err) in res {
+        if rc != 0 {
+            let lines: Vec<String> = err
+                .lines()
+                .filter(|l| l.contains("error:") || l.contains("fatal error:") || l.contains("note:"))
+                .take(8)
+                .map(|s| s.trim().to_string())
+                .collect();
+            errs.push((label, lines));
+        }
+    }
+    (checked, errs)
 }
 
 #[cfg(test)]

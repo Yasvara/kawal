@@ -161,8 +161,9 @@ pub fn run_abi_audit(ctx: &Ctx, base: &str, head: &str) -> (i32, String) {
         let Some(ref f) = cur_file else { continue };
         if ln.starts_with("@@ ") {
             let hdr = ln.split("@@").nth(2).unwrap_or("").trim();
-            if let Some(idx) = hdr.find("struct ") {
-                let sname: String = hdr[idx + 7..]
+            // Only match top-level `struct <name>` definitions, NOT function params like `fn(struct vm_area_struct *vma`!
+            if hdr.starts_with("struct ") && !hdr.contains('(') {
+                let sname: String = hdr[7..]
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                     .collect();

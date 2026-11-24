@@ -1,11 +1,16 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use crate::backport_sem::{
+    analyze_hunk_semantics, detect_extra_callers, detect_struct_impact, find_series_siblings,
+    SemanticCache,
+};
 use crate::merge_intel::{is_clo_soc_path, ACK_PROTECTED_MARKERS};
+use crate::preflight;
 use crate::util::{
     git, git_in, git_rc, git_stdin, is_built_file, norm_subj, par_map, rg, run_cmd, truncate_str,
-    Ctx, BOILERPLATE_PREFIXES, C_KEYWORDS, NOT_A_CALL,
+    Ctx, BOILERPLATE_PREFIXES, C_KEYWORDS,
 };
 
 // ====================================================== Helpers & Diff Parser
@@ -268,11 +273,15 @@ pub fn extract_func_name(func_ctx: &str) -> Option<String> {
     }
 }
 
-/// Compute how much of a patch's meaningful `+` lines are ALREADY present in local HEAD files.
-/// Returns `(matched, total, pct)` across all non-doc C/H files.
+/// Compute how much of a patch's meaningful `+` lines are ALREADY present in local HEAD files
+/// AND verify meaningful `-` lines are mostly gone (prevents code-move commits from false-matching).
+/// Returns `(matched, total, pct)` across all non-doc C/H files; `pct` is gated to 0 if >40% of
+/// deleted meaningful lines still exist in HEAD.
 pub fn semantic_already_ratio(ctx: &Ctx, file_patches: &[FilePatch]) -> (usize, usize, usize) {
     let mut matched = 0usize;
     let mut total = 0usize;
+    let mut del_gone = 0usize;
+    let mut del_total = 0usize;
     for fp in file_patches {
         if fp.is_doc_or_ignored() {
             continue;
@@ -294,11 +303,16 @@ pub fn semantic_already_ratio(ctx: &Ctx, file_patches: &[FilePatch]) -> (usize, 
         }
         let local_norm_lines: HashSet<String> = local_txt.lines().map(norm_ws).collect();
         for h in &fp.hunks {
-            // Check both pure additions and net-changed lines
             let del_set: HashSet<String> = h
                 .lines
                 .iter()
                 .filter_map(|l| l.strip_prefix('-'))
+                .map(norm_ws)
+                .collect();
+            let add_set: HashSet<String> = h
+                .lines
+                .iter()
+                .filter_map(|l| l.strip_prefix('+'))
                 .map(norm_ws)
                 .collect();
             for l in &h.lines {
@@ -314,16 +328,31 @@ pub fn semantic_already_ratio(ctx: &Ctx, file_patches: &[FilePatch]) -> (usize, 
                     if local_norm_lines.contains(&nw) {
                         matched += 1;
                     }
+                } else if let Some(body) = l.strip_prefix('-') {
+                    if !is_meaningful_code_line(body) {
+                        continue;
+                    }
+                    let nw = norm_ws(body);
+                    if add_set.contains(&nw) {
+                        continue;
+                    }
+                    del_total += 1;
+                    if !local_norm_lines.contains(&nw) {
+                        del_gone += 1;
+                    }
                 }
             }
         }
     }
-    let pct = if total == 0 {
-        0
-    } else {
-        (matched * 100) / total
-    };
-    (matched, total, pct)
+    if total == 0 {
+        return (0, 0, 0);
+    }
+    let add_pct = (matched * 100) / total;
+    // If substantial deleted lines are still present in HEAD, this commit is NOT already applied!
+    if del_total >= 3 && (del_gone * 100) / del_total < 60 {
+        return (matched, total, add_pct.min(50));
+    }
+    (matched, total, add_pct)
 }
 
 /// Check if a single hunk's added meaningful lines are all already present in `local_lines`
@@ -470,70 +499,6 @@ fn find_hunk_anchor(
     func_line.unwrap_or(h.old_start.max(1).min(local_lines.len().max(1)))
 }
 
-/// Extract C function call identifiers newly introduced in `+` lines that might not exist in 6.12.
-fn extract_new_calls_in_hunk(h: &PatchHunk) -> BTreeSet<String> {
-    let mut del_syms = HashSet::new();
-    let mut add_syms = BTreeSet::new();
-    let scan = |s: &str, out: &mut Vec<String>| {
-        let b = s.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            if b[i].is_ascii_alphabetic() || b[i] == b'_' {
-                let st = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                let ident = &s[st..i];
-                let mut j = i;
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if j < b.len()
-                    && b[j] == b'('
-                    && ident.len() >= 5
-                    && !NOT_A_CALL.contains(&ident)
-                    && !C_KEYWORDS.contains(&ident)
-                {
-                    out.push(ident.to_string());
-                }
-            } else {
-                i += 1;
-            }
-        }
-    };
-    for l in &h.lines {
-        if let Some(body) = l.strip_prefix('-') {
-            let mut v = Vec::new();
-            scan(body, &mut v);
-            for s in v {
-                del_syms.insert(s);
-            }
-        } else if let Some(body) = l.strip_prefix(' ') {
-            let mut v = Vec::new();
-            scan(body, &mut v);
-            for s in v {
-                del_syms.insert(s);
-            }
-        }
-    }
-    for l in &h.lines {
-        if let Some(body) = l.strip_prefix('+') {
-            let t = body.trim();
-            if t.starts_with('*') || t.starts_with("//") || t.starts_with("/*") {
-                continue;
-            }
-            let mut v = Vec::new();
-            scan(body, &mut v);
-            for s in v {
-                if !del_syms.contains(&s) {
-                    add_syms.insert(s);
-                }
-            }
-        }
-    }
-    add_syms
-}
-
 fn compact_commit_rationale(up_path: &Path, sha: &str, max_lines: usize) -> Vec<String> {
     let body = git_in(up_path, &["show", "-s", "--format=%b", sha]);
     let mut out = Vec::new();
@@ -562,6 +527,7 @@ pub fn cmd_backport_check(
     shas: &[String],
     apply_clean: bool,
     no_doc: bool,
+    deep: bool,
 ) -> i32 {
     let up_path = Path::new(upstream_repo);
     if !up_path.exists() {
@@ -570,12 +536,17 @@ pub fn cmd_backport_check(
     }
     let expanded_shas = expand_shas(shas);
     if expanded_shas.is_empty() {
-        eprintln!("usage: kawal backport-check <upstream.git> [--apply-clean] [--no-doc] <shas...|@file>");
+        eprintln!("usage: kawal backport-check <upstream.git> [--apply-clean] [--no-doc] [--deep] <shas...|@file>");
         return 2;
     }
 
     let local_log = git(ctx, &["log", "--no-merges", "-n", "20000", "--format=%s", "HEAD"]);
     let local_subjs: HashSet<String> = local_log.lines().map(norm_subj).collect();
+    let batch_full: HashSet<String> = expanded_shas
+        .iter()
+        .map(|s| git_in(up_path, &["rev-parse", s]).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     struct BpRes {
         sha: String,
@@ -589,6 +560,7 @@ pub fn cmd_backport_check(
     }
 
     let results: Vec<BpRes> = par_map(&expanded_shas, ctx.threads, |sha| {
+        let full = git_in(up_path, &["rev-parse", sha]).trim().to_string();
         let subj = git_in(up_path, &["show", "-s", "--format=%s", sha])
             .trim()
             .to_string();
@@ -658,6 +630,59 @@ pub fn cmd_backport_check(
                 "ADAPT".to_string()
             }
         };
+
+        // Optional `--deep` semantic scan even on CLEAN commits (catches silent arity drift, sleep-under-lock, extra callers, series gaps!)
+        if deep && matches!(status.as_str(), "CLEAN" | "CLEAN-C1" | "CLEAN-NODOC" | "ADAPT") && !full.is_empty() {
+            let fps = parse_unified_diff(&patch_str);
+            let mut sem_cache = SemanticCache::default();
+            let mut n_drift = 0usize;
+            let mut n_undef = 0usize;
+            let mut n_sleep = 0usize;
+            let mut n_extra = 0usize;
+            let mut n_struct = 0usize;
+            for fp in &fps {
+                if fp.is_doc_or_ignored() {
+                    continue;
+                }
+                let local_txt = fs::read_to_string(ctx.repo.join(fp.display_path())).unwrap_or_default();
+                n_extra += detect_extra_callers(ctx, fp, &fps).len();
+                n_struct += detect_struct_impact(ctx, fp).len();
+                for h in &fp.hunks {
+                    let rep = analyze_hunk_semantics(ctx, up_path, &full, fp, h, &local_txt, &mut sem_cache, false);
+                    n_drift += rep.api_drifts.len();
+                    n_undef += rep.undef_syms.len() + rep.undef_consts.len() + rep.undef_fields.len();
+                    n_sleep += rep.atomic_sleeps.len();
+                }
+            }
+            let mut tags = Vec::new();
+            if n_drift > 0 {
+                tags.push(format!("API-DRIFT({n_drift})"));
+            }
+            if n_undef > 0 {
+                tags.push(format!("UNDEF({n_undef})"));
+            }
+            if n_sleep > 0 {
+                tags.push(format!("ATOMIC-SLEEP({n_sleep})!"));
+            }
+            if n_extra > 0 {
+                tags.push(format!("EXTRA-CALLER({n_extra})"));
+            }
+            if n_struct > 0 {
+                tags.push(format!("STRUCT({n_struct})"));
+            }
+            if let Some(sinfo) = find_series_siblings(ctx, up_path, &full, &local_subjs, &batch_full) {
+                let gaps = sinfo.siblings.iter().filter(|s| s.is_before && matches!(s.state, "MISSING" | "CLEAN")).count();
+                if gaps > 0 {
+                    tags.push(format!("SERIES-GAP({gaps})"));
+                }
+            }
+            if !tags.is_empty() {
+                if !note.is_empty() {
+                    note.push_str("; ");
+                }
+                note.push_str(&tags.join(" "));
+            }
+        }
 
         let mut has_ack = false;
         let mut has_clo = false;
@@ -800,6 +825,7 @@ pub fn cmd_backport_apply(
     shas: &[String],
     no_doc: bool,
     sign: bool,
+    compile_check: bool,
     stop_on_conflict: bool,
 ) -> i32 {
     let up_path = Path::new(upstream_repo);
@@ -809,7 +835,7 @@ pub fn cmd_backport_apply(
     }
     let expanded = expand_shas(shas);
     if expanded.is_empty() {
-        eprintln!("usage: kawal backport-apply <upstream.git> [--no-doc] [--no-sign] [--stop-on-conflict] <shas...|@file>");
+        eprintln!("usage: kawal backport-apply <upstream.git> [--no-doc] [--no-sign] [--check] [--stop-on-conflict] <shas...|@file>");
         return 2;
     }
     let status_out = git(ctx, &["status", "--porcelain"]);
@@ -823,13 +849,15 @@ pub fn cmd_backport_apply(
 
     let mut applied = 0usize;
     let mut skipped = 0usize;
+    let mut compile_errs = 0usize;
     let mut conflicts: Vec<String> = Vec::new();
 
     println!(
-        "=== kawal backport-apply ({} commits, sign={}, no_doc={}) ===",
+        "=== kawal backport-apply ({} commits, sign={}, no_doc={}, check={}) ===",
         expanded.len(),
         sign,
-        no_doc
+        no_doc,
+        compile_check
     );
 
     for sha in &expanded {
@@ -914,9 +942,35 @@ pub fn cmd_backport_apply(
         }
 
         if ok {
-            println!("  {:<12} {short} | {}", tag, truncate_str(&subj, 60));
+            let mut err_detail: Vec<(String, Vec<String>)> = Vec::new();
+            let mut chk_tag = String::new();
+            if compile_check {
+                let c_files: Vec<String> = fps
+                    .iter()
+                    .map(|fp| fp.display_path().to_string())
+                    .filter(|p| p.ends_with(".c"))
+                    .collect();
+                let (checked, errs) = preflight::quick_syntax_check(ctx, &c_files);
+                if !errs.is_empty() {
+                    compile_errs += 1;
+                    chk_tag = " [COMPILE-ERR!]".to_string();
+                    err_detail = errs;
+                } else if checked > 0 {
+                    chk_tag = format!(" [cc:{checked} OK]");
+                }
+            }
+            println!("  {:<12} {short} | {}{}", tag, truncate_str(&subj, 55), chk_tag);
+            for (f, lines) in &err_detail {
+                println!("    !! {f}:");
+                for el in lines.iter().take(5) {
+                    println!("       {el}");
+                }
+            }
             local_subjs.insert(norm_subj(&subj));
             applied += 1;
+            if !err_detail.is_empty() && stop_on_conflict {
+                break;
+            }
         } else if (total >= 2 && pct >= 75) || (total == 1 && matched == 1) {
             println!(
                 "  SKIP(code)   {short} | {} [{matched}/{total} +lines ({pct}%) in HEAD]",
@@ -933,10 +987,15 @@ pub fn cmd_backport_apply(
     }
 
     println!(
-        "Summary: {} applied | {} skipped (already in HEAD) | {} conflict(s)",
+        "Summary: {} applied | {} skipped (already in HEAD) | {} conflict(s){}",
         applied,
         skipped,
-        conflicts.len()
+        conflicts.len(),
+        if compile_errs > 0 {
+            format!(" | {} COMPILE-ERR(s)!", compile_errs)
+        } else {
+            String::new()
+        }
     );
     if !conflicts.is_empty() {
         println!(
@@ -1035,9 +1094,14 @@ pub fn cmd_backport_ctx(
 
     let local_log = git(ctx, &["log", "--no-merges", "-n", "20000", "--format=%s", "HEAD"]);
     let local_subjs: HashSet<String> = local_log.lines().map(norm_subj).collect();
+    let batch_full: HashSet<String> = expanded
+        .iter()
+        .map(|s| git_in(up_path, &["rev-parse", s]).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-    // Cache symbol existence checks across commits to avoid duplicate rg calls
-    let mut sym_cache: HashMap<String, bool> = HashMap::new();
+    // Cache semantic symbol/signature/upstream lookups across commits
+    let mut sem_cache = SemanticCache::default();
     let mut staged_ok = 0usize;
     let mut remaining_conflicts = 0usize;
 
@@ -1066,6 +1130,42 @@ pub fn cmd_backport_ctx(
         for line in compact_commit_rationale(up_path, &full, 3) {
             println!("  WHY: {}", truncate_str(&line, 110));
         }
+        // Surface upstream mailing-list series siblings (prereqs before & follow-ups after!)
+        if let Some(sinfo) = find_series_siblings(ctx, up_path, &full, &local_subjs, &batch_full) {
+            let missing_before: Vec<_> = sinfo
+                .siblings
+                .iter()
+                .filter(|s| s.is_before && matches!(s.state, "MISSING" | "CLEAN"))
+                .collect();
+            let follow_ups: Vec<_> = sinfo
+                .siblings
+                .iter()
+                .filter(|s| !s.is_before && s.state != "SELF" && s.state != "IN-HEAD")
+                .collect();
+            let pos_lbl = sinfo
+                .self_num
+                .map(|n| format!("patch #{n} of {}", sinfo.siblings.len()))
+                .unwrap_or_else(|| format!("{} patches", sinfo.siblings.len()));
+            if !missing_before.is_empty() || !follow_ups.is_empty() {
+                println!(
+                    "  [SERIES]    {} ({pos_lbl} | {} missing prereq(s), {} follow-up(s)):",
+                    sinfo.series_id.trim_end_matches('-'),
+                    missing_before.len(),
+                    follow_ups.len()
+                );
+                for s in missing_before.iter().take(6) {
+                    let pno = s.patch_num.map(|n| format!("#{n:<2}")).unwrap_or_else(|| "   ".into());
+                    println!("    ! PRE-REQ {:<7} {pno} {} | {}", s.state, s.sha, truncate_str(&s.subj, 64));
+                }
+                if missing_before.len() > 6 {
+                    println!("    ! ... (+{} earlier prereq(s))", missing_before.len() - 6);
+                }
+                for s in follow_ups.iter().take(3) {
+                    let pno = s.patch_num.map(|n| format!("#{n:<2}")).unwrap_or_else(|| "   ".into());
+                    println!("    ~ FOLLOW  {:<7} {pno} {} | {}", s.state, s.sha, truncate_str(&s.subj, 64));
+                }
+            }
+        }
 
         for fp in &fps {
             if !include_doc && fp.is_doc_or_ignored() {
@@ -1078,6 +1178,12 @@ pub fn cmd_backport_ctx(
             let orig_norm_set: HashSet<String> = orig_lines.iter().map(|s| norm_ws(s)).collect();
 
             println!("--- FILE: {orig_path} ({} hunk(s)) ---", fp.hunks.len());
+            for si in detect_struct_impact(ctx, fp) {
+                println!("  [STRUCT-MOD] {si}");
+            }
+            for ec in detect_extra_callers(ctx, fp, &fps) {
+                println!("  [EXTRA-CALL] {ec}");
+            }
             let mut file_had_conflict = false;
 
             for (hi, h) in fp.hunks.iter().enumerate() {
@@ -1087,10 +1193,40 @@ pub fn cmd_backport_ctx(
                 let n_add = h.lines.iter().filter(|l| l.starts_with('+')).count();
                 let n_del = h.lines.iter().filter(|l| l.starts_with('-')).count();
 
+                // Run semantic diagnostics even for clean hunks so API-drift / atomic-sleep never hides!
+                let is_dup = git_stdin(ctx, &["apply", "--check", "--reverse"], single_patch.as_bytes()).0 == 0
+                    || hunk_already_in_local(h, &orig_norm_set);
+                let sem = if is_dup {
+                    Default::default()
+                } else {
+                    analyze_hunk_semantics(ctx, up_path, &full, fp, h, &orig_txt, &mut sem_cache, true)
+                };
+                let has_sem_alert = !sem.api_drifts.is_empty()
+                    || !sem.atomic_sleeps.is_empty()
+                    || !sem.undef_syms.is_empty()
+                    || !sem.undef_consts.is_empty()
+                    || !sem.undef_fields.is_empty();
+
+                let print_sem = |sem: &crate::backport_sem::HunkSemReport| {
+                    for s in &sem.atomic_sleeps {
+                        println!("  [ATOMIC-SLEEP] !! {s}");
+                    }
+                    for d in &sem.api_drifts {
+                        println!("  [API-DRIFT]    !! {d}");
+                    }
+                    for u in &sem.undef_syms {
+                        println!("  [UNDEF-SYM]    {u}");
+                    }
+                    for c in &sem.undef_consts {
+                        println!("  [UNDEF-CONST]  {c}");
+                    }
+                    for f in &sem.undef_fields {
+                        println!("  [UNDEF-FIELD]  {f}");
+                    }
+                };
+
                 // 1. Test individual hunk against HEAD
-                if git_stdin(ctx, &["apply", "--check", "--reverse"], single_patch.as_bytes()).0 == 0
-                    || hunk_already_in_local(h, &orig_norm_set)
-                {
+                if is_dup {
                     println!("  [HUNK-DUP]  #{}/{} {fn_label}() (+{n_add}/-{n_del}) -> already in HEAD", hi + 1, fp.hunks.len());
                     if !all_hunks {
                         continue;
@@ -1099,11 +1235,22 @@ pub fn cmd_backport_ctx(
                     if stage_ok_hunks {
                         if git_stdin(ctx, &["apply", "-C1"], single_patch.as_bytes()).0 == 0 {
                             staged_ok += 1;
-                            println!("  [APPLIED]   #{}/{} {fn_label}() (+{n_add}/-{n_del}) -> applied to working tree!", hi + 1, fp.hunks.len());
+                            if has_sem_alert {
+                                println!("  [APPLIED!]  #{}/{} {fn_label}() (+{n_add}/-{n_del}) -> applied, BUT semantic alert(s) below!", hi + 1, fp.hunks.len());
+                                print_sem(&sem);
+                            } else {
+                                println!("  [APPLIED]   #{}/{} {fn_label}() (+{n_add}/-{n_del}) -> applied to working tree!", hi + 1, fp.hunks.len());
+                            }
+                            continue;
+                        }
+                    } else if !has_sem_alert {
+                        println!("  [HUNK-OK]   #{}/{} {fn_label}() (+{n_add}/-{n_del}) -> applies cleanly with -C1", hi + 1, fp.hunks.len());
+                        if !all_hunks {
                             continue;
                         }
                     } else {
-                        println!("  [HUNK-OK]   #{}/{} {fn_label}() (+{n_add}/-{n_del}) -> applies cleanly with -C1", hi + 1, fp.hunks.len());
+                        println!("  [HUNK-OK!]  #{}/{} {fn_label}() (+{n_add}/-{n_del}) -> applies with -C1, BUT semantic alert(s)!", hi + 1, fp.hunks.len());
+                        print_sem(&sem);
                         if !all_hunks {
                             continue;
                         }
@@ -1114,7 +1261,7 @@ pub fn cmd_backport_ctx(
                     println!("  [CONFLICT]  #{}/{} {fn_label}() (+{n_add}/-{n_del})", hi + 1, fp.hunks.len());
                 }
 
-                // 2. Print compact upstream hunk (strip leading/trailing unchanged lines beyond 2)
+                // 2. Print compact upstream hunk
                 println!("  [UPSTREAM] {}", h.header);
                 for l in &h.lines {
                     println!("    {l}");
@@ -1177,25 +1324,8 @@ pub fn cmd_backport_ctx(
                     }
                 }
 
-                // 4. Flag any new helper calls introduced in `+` lines that are absent in HEAD
-                let new_calls = extract_new_calls_in_hunk(h);
-                let mut undef = Vec::new();
-                for sym in new_calls {
-                    let exists = *sym_cache.entry(sym.clone()).or_insert_with(|| {
-                        let pat = format!(r"\b{sym}\b");
-                        let (rc, _) = rg(
-                            &ctx.repo,
-                            &["-q", "-g", "*.[ch]", &pat, "include", "mm", "kernel", "fs", "net", "block", "arch/arm64", "drivers"],
-                        );
-                        rc == 0
-                    });
-                    if !exists {
-                        undef.push(sym);
-                    }
-                }
-                if !undef.is_empty() {
-                    println!("  [UNDEF-SYM] New call(s) NOT found in HEAD: {}", undef.join(", "));
-                }
+                // 4. Print semantic diagnostics (API drift, atomic sleep, missing syms/consts/fields w/ upstream defs!)
+                print_sem(&sem);
             }
 
             if file_had_conflict {
@@ -1228,6 +1358,7 @@ pub fn cmd_backport_commit(
     sha: &str,
     files: &[String],
     sign: bool,
+    compile_check: bool,
     allow_hook_drop: bool,
 ) -> i32 {
     let up_path = Path::new(upstream_repo);
@@ -1272,6 +1403,30 @@ pub fn cmd_backport_commit(
     if staged.trim().is_empty() {
         eprintln!("!! nothing staged to commit for {sha}");
         return 1;
+    }
+
+    // Optional fast real clang -fsyntax-only compile gate on staged .c files!
+    if compile_check {
+        let staged_files: Vec<String> = git(ctx, &["diff", "--cached", "--name-only"])
+            .lines()
+            .map(str::trim)
+            .filter(|s| s.ends_with(".c"))
+            .map(str::to_string)
+            .collect();
+        let (checked, errs) = preflight::quick_syntax_check(ctx, &staged_files);
+        if !errs.is_empty() {
+            eprintln!("!! COMPILE-CHECK BLOCKED commit for {sha} ({}/{} TU failed):", errs.len(), checked);
+            for (f, lines) in &errs {
+                eprintln!("  --- {f} ---");
+                for el in lines {
+                    eprintln!("    {el}");
+                }
+            }
+            return 1;
+        }
+        if checked > 0 {
+            println!("  [cc:{checked} TU OK]");
+        }
     }
 
     // Built-in safety guard: catch accidental deletion of Android vendor hooks or EXPORT_SYMBOL!
@@ -1378,6 +1533,289 @@ pub fn cmd_backport_search(
     0
 }
 
+// ====================================================== 6. `kawal backport-series`
+
+/// Topological upstream sorter + series-gap finder + 16-core semantic risk dashboard for an entire
+/// backport batch (detects out-of-order SHAs, missing upstream series prerequisites, API arity drift,
+/// atomic-sleep traps, extra unpatched callers, and struct layout changes in one shot!).
+pub fn cmd_backport_series(ctx: &Ctx, upstream_repo: &str, shas: &[String]) -> i32 {
+    let up_path = Path::new(upstream_repo);
+    if !up_path.exists() {
+        eprintln!("!! upstream git mirror not found: {upstream_repo}");
+        return 2;
+    }
+    let expanded = expand_shas(shas);
+    if expanded.is_empty() {
+        eprintln!("usage: kawal backport-series <upstream.git> <shas...|@file>");
+        return 2;
+    }
+
+    // Resolve full SHAs & sort in true upstream chronological/topological order!
+    let mut resolved: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    for s in &expanded {
+        let full = git_in(up_path, &["rev-parse", s]).trim().to_string();
+        if !full.is_empty() && seen.insert(full.clone()) {
+            resolved.push(full);
+        } else if full.is_empty() {
+            eprintln!("  !! NOT-FOUND in upstream mirror: {s}");
+        }
+    }
+    if resolved.is_empty() {
+        return 1;
+    }
+
+    // Order by upstream commit timestamp + topological order from v6.12..HEAD
+    let batch_set: HashSet<String> = resolved.iter().cloned().collect();
+    let topo_out = git_in(up_path, &["rev-list", "--topo-order", "--reverse", "v6.12..HEAD"]);
+    let mut ordered: Vec<String> = Vec::with_capacity(resolved.len());
+    for ln in topo_out.lines() {
+        if batch_set.contains(ln) {
+            ordered.push(ln.to_string());
+        }
+    }
+    // Append any SHAs not reachable in v6.12..HEAD (e.g. older commits) in original order
+    for r in &resolved {
+        if !ordered.contains(r) {
+            ordered.push(r.clone());
+        }
+    }
+    let reordered = ordered != resolved;
+
+    let local_log = git(ctx, &["log", "--no-merges", "-n", "20000", "--format=%s", "HEAD"]);
+    let local_subjs: HashSet<String> = local_log.lines().map(norm_subj).collect();
+
+    struct SeriesRow {
+        short: String,
+        status: String,
+        btag: &'static str,
+        risk: &'static str,
+        file_preview: String,
+        subj: String,
+        flags: Vec<String>,
+        missing_prereqs: Vec<(String, &'static str, Option<u32>, String, String)>, // (sha, state, pnum, subj, series_id)
+    }
+
+    let rows: Vec<SeriesRow> = par_map(&ordered, ctx.threads, |full| {
+        let short = truncate_str(full, 10).to_string();
+        let subj = git_in(up_path, &["show", "-s", "--format=%s", full]).trim().to_string();
+        let files: Vec<String> = git_in(up_path, &["diff-tree", "--no-commit-id", "--name-only", "-r", full])
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let code_files: Vec<&String> = files.iter().filter(|f| !f.starts_with("Documentation/")).collect();
+        let file_preview = code_files
+            .iter()
+            .take(2)
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let built_cnt = files.iter().filter(|f| is_built_file(ctx, f)).count();
+        let btag = if built_cnt > 0 { "[BUILT]" } else { "[unbuilt]" };
+
+        let mut has_ack = false;
+        let mut has_clo = false;
+        for f in &files {
+            if is_clo_soc_path(f) {
+                has_clo = true;
+            }
+            if let Ok(txt) = fs::read_to_string(ctx.repo.join(f)) {
+                if ACK_PROTECTED_MARKERS.iter().any(|m| txt.contains(m)) {
+                    has_ack = true;
+                }
+            }
+        }
+        let risk = if has_clo {
+            "[CLO]"
+        } else if has_ack {
+            "[ACK]"
+        } else {
+            "     "
+        };
+
+        let (_, patch_str, _) = run_cmd("git", &["format-patch", "-1", "--stdout", full], up_path, None);
+        let nodoc_str = strip_doc_sections_from_mbox(&patch_str);
+        let has_docs = files.iter().any(|f| f.starts_with("Documentation/"));
+        let fps = parse_unified_diff(&patch_str);
+
+        let status = if local_subjs.contains(&norm_subj(&subj)) {
+            "IN-LOG".to_string()
+        } else if git_stdin(ctx, &["apply", "--check", "--reverse"], patch_str.as_bytes()).0 == 0 {
+            "ALREADY".to_string()
+        } else if git_stdin(ctx, &["apply", "--check"], patch_str.as_bytes()).0 == 0 {
+            "CLEAN".to_string()
+        } else if git_stdin(ctx, &["apply", "--check", "-C1"], patch_str.as_bytes()).0 == 0 {
+            "CLEAN-C1".to_string()
+        } else if has_docs && git_stdin(ctx, &["apply", "--check", "-C1"], nodoc_str.as_bytes()).0 == 0 {
+            "CLEAN-NODOC".to_string()
+        } else {
+            let (m, t, pct) = semantic_already_ratio(ctx, &fps);
+            if (t >= 2 && pct >= 75) || (t == 1 && m == 1) {
+                "ALREADY-CODE".to_string()
+            } else {
+                "ADAPT".to_string()
+            }
+        };
+
+        let mut flags = Vec::new();
+        let mut missing_prereqs = Vec::new();
+        if !matches!(status.as_str(), "IN-LOG" | "ALREADY" | "ALREADY-CODE") {
+            let mut sem_cache = SemanticCache::default();
+            let mut n_drift = 0usize;
+            let mut n_undef = 0usize;
+            let mut n_sleep = 0usize;
+            let mut n_extra = 0usize;
+            let mut n_struct = 0usize;
+            for fp in &fps {
+                if fp.is_doc_or_ignored() {
+                    continue;
+                }
+                let local_txt = fs::read_to_string(ctx.repo.join(fp.display_path())).unwrap_or_default();
+                n_extra += detect_extra_callers(ctx, fp, &fps).len();
+                n_struct += detect_struct_impact(ctx, fp).len();
+                for h in &fp.hunks {
+                    let rep = analyze_hunk_semantics(ctx, up_path, full, fp, h, &local_txt, &mut sem_cache, false);
+                    n_drift += rep.api_drifts.len();
+                    n_undef += rep.undef_syms.len() + rep.undef_consts.len() + rep.undef_fields.len();
+                    n_sleep += rep.atomic_sleeps.len();
+                }
+            }
+            if n_sleep > 0 {
+                flags.push(format!("SLEEP({n_sleep})!"));
+            }
+            if n_drift > 0 {
+                flags.push(format!("ARITY({n_drift})"));
+            }
+            if n_undef > 0 {
+                flags.push(format!("UNDEF({n_undef})"));
+            }
+            if n_extra > 0 {
+                flags.push(format!("CALLERS({n_extra})"));
+            }
+            if n_struct > 0 {
+                flags.push(format!("STRUCT({n_struct})"));
+            }
+            if let Some(sinfo) = find_series_siblings(ctx, up_path, full, &local_subjs, &batch_set) {
+                let mut gaps = 0usize;
+                for s in &sinfo.siblings {
+                    if s.is_before && matches!(s.state, "MISSING" | "CLEAN") {
+                        gaps += 1;
+                        missing_prereqs.push((
+                            s.sha.clone(),
+                            s.state,
+                            s.patch_num,
+                            s.subj.clone(),
+                            sinfo.series_id.trim_end_matches('-').to_string(),
+                        ));
+                    }
+                }
+                if gaps > 0 {
+                    flags.push(format!("SER-GAP({gaps})"));
+                }
+            }
+        }
+
+        SeriesRow {
+            short,
+            status,
+            btag,
+            risk,
+            file_preview,
+            subj,
+            flags,
+            missing_prereqs,
+        }
+    });
+
+    println!(
+        "=== kawal backport-series ({} commits, topo-sorted{}) ===",
+        rows.len(),
+        if reordered { ", REORDERED from input!" } else { "" }
+    );
+    let mut n_already = 0usize;
+    let mut n_clean = 0usize;
+    let mut n_adapt = 0usize;
+    let mut clean_shas = Vec::new();
+    let mut adapt_shas = Vec::new();
+    let mut all_prereqs: BTreeMap<(String, u32, String), (&'static str, Option<u32>, String, Vec<String>)> = BTreeMap::new();
+
+    for (i, r) in rows.iter().enumerate() {
+        match r.status.as_str() {
+            "IN-LOG" | "ALREADY" | "ALREADY-CODE" => n_already += 1,
+            "CLEAN" | "CLEAN-C1" | "CLEAN-NODOC" => {
+                n_clean += 1;
+                clean_shas.push(r.short.clone());
+            }
+            _ => {
+                n_adapt += 1;
+                adapt_shas.push(r.short.clone());
+            }
+        }
+        let flag_s = if r.flags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", r.flags.join(" "))
+        };
+        println!(
+            "  {:>2}. {:<12} {:<9} {} {} | {:<28} | {}{}",
+            i + 1,
+            r.status,
+            r.btag,
+            r.risk,
+            r.short,
+            truncate_str(&r.file_preview, 28),
+            truncate_str(&r.subj, 46),
+            flag_s
+        );
+        for (psha, pstate, pnum, psubj, sid) in &r.missing_prereqs {
+            let key = (sid.clone(), pnum.unwrap_or(999), psha.clone());
+            let entry = all_prereqs
+                .entry(key)
+                .or_insert_with(|| (*pstate, *pnum, psubj.clone(), Vec::new()));
+            if !entry.3.contains(&r.short) {
+                entry.3.push(r.short.clone());
+            }
+        }
+    }
+
+    if !all_prereqs.is_empty() {
+        println!("\n--- MISSING UPSTREAM SERIES PREREQUISITES ({}, grouped by series & patch #) ---", all_prereqs.len());
+        let mut last_sid = String::new();
+        for ((sid, _, psha), (pstate, pnum, psubj, needed_by)) in &all_prereqs {
+            if *sid != last_sid {
+                println!("  [series {sid}]");
+                last_sid = sid.clone();
+            }
+            let pno = pnum.map(|n| format!("#{n:<2}")).unwrap_or_else(|| "   ".into());
+            println!(
+                "    {:<7} {pno} {psha} | {:<50} <- before {}",
+                pstate,
+                truncate_str(psubj, 50),
+                needed_by.join(",")
+            );
+        }
+    }
+
+    println!(
+        "\nSummary: {n_already} already/in-log | {n_clean} clean | {n_adapt} adapt | {} missing series prereq(s)",
+        all_prereqs.len()
+    );
+    if !clean_shas.is_empty() {
+        println!(
+            "Batch apply (w/ live clang check):\n  kawal backport-apply {upstream_repo} --check {}",
+            ordered.iter().map(|s| truncate_str(s, 10)).collect::<Vec<_>>().join(" ")
+        );
+    }
+    if !adapt_shas.is_empty() {
+        println!(
+            "Inspect semantic conflicts:\n  kawal backport-ctx {upstream_repo} {}",
+            adapt_shas.join(" ")
+        );
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1428,25 +1866,5 @@ diff --git a/fs/f2fs/super.c b/fs/f2fs/super.c
         let stripped = strip_doc_sections_from_mbox(mbox);
         assert!(!stripped.contains("Documentation/foo.rst"));
         assert!(stripped.contains("fs/f2fs/super.c"));
-    }
-
-    #[test]
-    fn test_extract_new_calls_in_hunk() {
-        let h = PatchHunk {
-            header: "@@ -1,3 +1,4 @@ static void foo(void)".into(),
-            old_start: 1,
-            old_count: 3,
-            func_ctx: "static void foo(void)".into(),
-            lines: vec![
-                " \told_helper(x);".into(),
-                "-\tremove_me(x);".into(),
-                "+\tbrand_new_helper(x);".into(),
-                "+\tif (unlikely(x)) return;".into(),
-            ],
-        };
-        let calls = extract_new_calls_in_hunk(&h);
-        assert!(calls.contains("brand_new_helper"));
-        assert!(!calls.contains("old_helper"));
-        assert!(!calls.contains("unlikely"));
     }
 }
