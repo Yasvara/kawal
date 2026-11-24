@@ -510,11 +510,92 @@ fn parse_proto_name(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), sig))
 }
 
+/// Extract struct-ops function-pointer callback names whose parameter list changed in a header diff.
+/// Catches multi-line diffs like `cfg80211_ops.set_monitor_channel` gaining `struct net_device *dev`.
+pub fn extract_changed_ops_callbacks(diff_text: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut cur_hdr = String::new();
+    // (cb_name, header, saw_change, is_pure_add)
+    let mut active: Option<(String, String, bool, bool)> = None;
+
+    let parse_cb = |s: &str| -> Option<String> {
+        let idx = s.find("(*")?;
+        let after = &s[idx + 2..];
+        let close = after.find(")(")?;
+        let name = after[..close].trim();
+        if name.len() >= 5
+            && name.as_bytes()[0].is_ascii_lowercase()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            Some(name.to_string())
+        } else {
+            None
+        }
+    };
+
+    for ln in diff_text.lines() {
+        if let Some(p) = ln.strip_prefix("+++ b/") {
+            active = None;
+            cur_hdr = p.trim().to_string();
+            continue;
+        }
+        if ln.starts_with("--- ") || ln.starts_with("@@ ") || ln.starts_with("diff ") {
+            active = None;
+            continue;
+        }
+        let prefix = ln.as_bytes().first().copied().unwrap_or(b' ');
+        let is_chg = prefix == b'+' || prefix == b'-';
+        let body = if prefix == b'+' || prefix == b'-' || prefix == b' ' {
+            &ln[1..]
+        } else {
+            ln
+        };
+        let trim = strip_c_comments(body).trim();
+        if trim.is_empty() {
+            active = None;
+            continue;
+        }
+        if let Some(cb) = parse_cb(trim) {
+            let pure_add = prefix == b'+';
+            if trim.contains(");") {
+                if is_chg && !pure_add {
+                    out.insert(cb, cur_hdr.clone());
+                } else if is_chg && pure_add {
+                    // Could be modified single-line callback (paired with a `-` line)
+                    out.entry(cb).or_insert_with(|| cur_hdr.clone());
+                }
+                active = None;
+            } else {
+                active = Some((cb, cur_hdr.clone(), is_chg, pure_add));
+            }
+            continue;
+        }
+        if let Some((ref cb, ref hdr, ref mut chg, ref mut pure_add)) = active {
+            if is_chg {
+                *chg = true;
+            }
+            if prefix != b'+' {
+                *pure_add = false;
+            }
+            if trim.contains(");") {
+                if *chg && !*pure_add {
+                    out.insert(cb.clone(), hdr.clone());
+                }
+                active = None;
+            }
+        }
+    }
+    out
+}
+
 pub fn cmd_vendorapi(ctx: &Ctx, base: &str, tag: &str) -> i32 {
-    println!("=== {base} -> {tag}: changed include/ prototypes vs vendor & modules ===");
+    println!("=== {base} -> {tag}: changed include/ prototypes & ops callbacks vs vendor & modules ===");
+    let diff = git(ctx, &["diff", "-U4", base, tag, "--", "include/"]);
     let mut removed: HashMap<String, String> = HashMap::new();
     let mut added: HashMap<String, String> = HashMap::new();
-    for ln in git(ctx, &["diff", base, tag, "--", "include/"]).lines() {
+    for ln in diff.lines() {
         if let Some((name, sig)) = parse_proto_name(ln) {
             if ln.starts_with('-') {
                 removed.insert(name, sig);
@@ -529,8 +610,9 @@ pub fn cmd_vendorapi(ctx: &Ctx, base: &str, tag: &str) -> i32 {
         .filter(|(k, old_sig)| added.get(*k).is_some_and(|new_sig| new_sig != *old_sig))
         .map(|(k, _)| k.clone())
         .collect();
-    if names.is_empty() {
-        println!("  no prototype churn in include/");
+    let changed_cbs = extract_changed_ops_callbacks(&diff);
+    if names.is_empty() && changed_cbs.is_empty() {
+        println!("  no prototype or ops-callback churn in include/");
         return 0;
     }
 
@@ -553,56 +635,93 @@ pub fn cmd_vendorapi(ctx: &Ctx, base: &str, tag: &str) -> i32 {
         Vec::new()
     };
     println!(
-        "    {} changed prototypes vs {} vendor-only + {} module files",
+        "    {} changed prototypes + {} changed ops callbacks vs {} vendor-only + {} module files",
         names.len(),
+        changed_cbs.len(),
         vendor_files.len(),
         mod_files.len()
     );
 
-    let pat = format!(r"\b({})\s*\(", names.join("|"));
     let mut hits: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if !names.is_empty() {
+        let pat = format!(r"\b({})\s*\(", names.join("|"));
+        // Scan vendor-only files in parallel in Rust (fast & zero arg-limit issue!)
+        let v_hits: Vec<Vec<(String, String)>> = par_map(&vendor_files, ctx.threads, |f| {
+            let mut local = Vec::new();
+            if let Ok(text) = fs::read_to_string(ctx.repo.join(f)) {
+                for (i, ln) in text.lines().enumerate() {
+                    for c in extract_calls(ln, 4) {
+                        if names.iter().any(|n| n == &c) {
+                            local.push((c, format!("{f}:{}", i + 1)));
+                        }
+                    }
+                }
+            }
+            local
+        });
+        for vec in v_hits {
+            for (fn_name, loc) in vec {
+                hits.entry(fn_name).or_default().push(loc);
+            }
+        }
 
-    // Scan vendor-only files in parallel in Rust (fast & zero arg-limit issue!)
-    let v_hits: Vec<Vec<(String, String)>> = par_map(&vendor_files, ctx.threads, |f| {
-        let mut local = Vec::new();
-        if let Ok(text) = fs::read_to_string(ctx.repo.join(f)) {
-            for (i, ln) in text.lines().enumerate() {
-                for c in extract_calls(ln, 4) {
-                    if names.iter().any(|n| n == &c) {
-                        local.push((c, format!("{f}:{}", i + 1)));
+        // Scan out-of-tree sm8735-modules in one rg pass
+        if !mod_files.is_empty() {
+            let (_, mout) = rg(&ctx.modules, &["-n", "-g", "*.c", "-g", "*.h", &pat]);
+            for ln in mout.lines() {
+                let p: Vec<&str> = ln.splitn(3, ':').collect();
+                if p.len() == 3 {
+                    for c in extract_calls(p[2], 4) {
+                        if names.iter().any(|n| n == &c) {
+                            hits.entry(c).or_default().push(format!("modules/{}:{}", p[0], p[1]));
+                        }
                     }
                 }
             }
         }
-        local
-    });
-    for vec in v_hits {
-        for (fn_name, loc) in vec {
-            hits.entry(fn_name).or_default().push(loc);
-        }
     }
 
-    // Scan out-of-tree sm8735-modules in one rg pass
-    if !mod_files.is_empty() {
-        let (_, mout) = rg(&ctx.modules, &["-n", "-g", "*.c", "-g", "*.h", &pat]);
-        for ln in mout.lines() {
-            let p: Vec<&str> = ln.splitn(3, ':').collect();
-            if p.len() == 3 {
-                for c in extract_calls(p[2], 4) {
-                    if names.iter().any(|n| n == &c) {
-                        hits.entry(c).or_default().push(format!("modules/{}:{}", p[0], p[1]));
+    // Also scan out-of-tree modules for `.cb_name = <impl>` ops-table initializers!
+    let mut cb_hits: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if !changed_cbs.is_empty() && !mod_files.is_empty() {
+        let cb_names: Vec<&str> = changed_cbs.keys().map(|s| s.as_str()).collect();
+        for chunk in cb_names.chunks(80) {
+            let pat = format!(r"\.({})\s*=", chunk.join("|"));
+            let (_, mout) = rg(&ctx.modules, &["-n", "-g", "*.c", "-g", "*.h", &pat]);
+            for ln in mout.lines() {
+                let p: Vec<&str> = ln.splitn(3, ':').collect();
+                if p.len() == 3 {
+                    let code = strip_c_comments(p[2]);
+                    for &cb in chunk {
+                        let needle = format!(".{cb}");
+                        if let Some(idx) = code.find(&needle) {
+                            let after = code[idx + needle.len()..].trim_start();
+                            if after.starts_with('=') {
+                                cb_hits
+                                    .entry(cb.to_string())
+                                    .or_default()
+                                    .push(format!("modules/{}:{}", p[0], p[1]));
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    if hits.is_empty() {
-        println!("  clean -- no vendor or module file calls a changed prototype");
+    if hits.is_empty() && cb_hits.is_empty() {
+        println!("  clean -- no vendor or module file calls a changed prototype or ops callback");
         return 0;
     }
     for (fn_name, locs) in hits {
         println!("  CHECK ARITY  {fn_name}()");
+        for loc in locs.iter().take(6) {
+            println!("      {loc}");
+        }
+    }
+    for (cb_name, locs) in cb_hits {
+        let hdr = changed_cbs.get(&cb_name).map(|s| s.as_str()).unwrap_or("include/");
+        println!("  CHECK OPS-CB .{cb_name} = ...  (changed in {hdr})");
         for loc in locs.iter().take(6) {
             println!("      {loc}");
         }
@@ -984,4 +1103,25 @@ pub fn cmd_check(ctx: &Ctx, base: &str, tag: &str, all_files: bool) -> i32 {
     rc |= cmd_vendorapi(ctx, base, tag);
     rc |= cmd_partial(ctx, base, tag, !all_files);
     rc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_changed_ops_callbacks_catches_cfg80211_set_monitor_channel() {
+        let diff = r#"+++ b/include/net/cfg80211.h
+@@ -4754,6 +4765,7 @@ struct cfg80211_ops {
+ 	int	(*set_monitor_channel)(struct wiphy *wiphy,
++				       struct net_device *dev,
+ 				       struct cfg80211_chan_def *chandef);
++	int	(*brand_new_unused_cb)(struct wiphy *wiphy, int flags);
+"#;
+        let cbs = extract_changed_ops_callbacks(diff);
+        assert_eq!(
+            cbs.get("set_monitor_channel").map(|s| s.as_str()),
+            Some("include/net/cfg80211.h")
+        );
+    }
 }

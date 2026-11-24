@@ -6,6 +6,7 @@ use crate::gate;
 use crate::util::*;
 
 const MERGE3_META_FILE: &str = "KAWAL_MERGE3_META";
+const LAST_MERGE_META_FILE: &str = "KAWAL_LAST_MERGE";
 
 /// Known QCOM CLO `soc-repo` overlay paths where CLO heavily extends/replaces upstream drivers.
 const CLO_SOC_PREFIXES: &[&str] = &[
@@ -27,6 +28,7 @@ const CLO_SOC_PREFIXES: &[&str] = &[
     "drivers/interconnect/qcom/",
     "drivers/clk/qcom/",
     "drivers/rpmsg/qcom_glink",
+    "drivers/iommu/arm/arm-smmu-v3/",
 ];
 
 /// Source-level markers that prove a file carries CLO-only `soc-repo` code.
@@ -63,8 +65,8 @@ const ACK_PROTECTED_MARKERS: &[&str] = &[
     "KBUILD_EXTMOD",
 ];
 
-pub fn read_merge3_meta(ctx: &Ctx) -> Option<(String, String)> {
-    let (_, p, _) = git_rc(ctx, &["rev-parse", "--git-path", MERGE3_META_FILE]);
+fn read_meta_file(ctx: &Ctx, name: &str) -> Option<(String, String)> {
+    let (_, p, _) = git_rc(ctx, &["rev-parse", "--git-path", name]);
     let p = p.trim();
     if p.is_empty() {
         return None;
@@ -85,18 +87,28 @@ pub fn read_merge3_meta(ctx: &Ctx) -> Option<(String, String)> {
     }
 }
 
+pub fn read_merge3_meta(ctx: &Ctx) -> Option<(String, String)> {
+    read_meta_file(ctx, MERGE3_META_FILE)
+}
+
+pub fn read_last_merge_meta(ctx: &Ctx) -> Option<(String, String)> {
+    read_meta_file(ctx, LAST_MERGE_META_FILE)
+}
+
 fn write_merge3_meta(ctx: &Ctx, base: &str, theirs: &str) {
-    let (_, p, _) = git_rc(ctx, &["rev-parse", "--git-path", MERGE3_META_FILE]);
-    let p = p.trim();
-    if p.is_empty() {
-        return;
+    for fname in [MERGE3_META_FILE, LAST_MERGE_META_FILE] {
+        let (_, p, _) = git_rc(ctx, &["rev-parse", "--git-path", fname]);
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let full = if Path::new(p).is_absolute() {
+            std::path::PathBuf::from(p)
+        } else {
+            ctx.repo.join(p)
+        };
+        let _ = fs::write(full, format!("{base}\n{theirs}\n"));
     }
-    let full = if Path::new(p).is_absolute() {
-        std::path::PathBuf::from(p)
-    } else {
-        ctx.repo.join(p)
-    };
-    let _ = fs::write(full, format!("{base}\n{theirs}\n"));
 }
 
 pub fn clear_merge3_meta(ctx: &Ctx) {
@@ -137,6 +149,7 @@ pub fn detect_clo_markers(ours: &str, theirs: &str) -> Vec<&'static str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriageBucket {
     AckKmiGuard,
+    KbuildGuard,
     CloSocOwned,
     HeaderWatch,
     Hybrid,
@@ -147,6 +160,7 @@ impl TriageBucket {
     pub fn label(&self) -> &'static str {
         match self {
             TriageBucket::AckKmiGuard => "ACK-KMI-GUARD",
+            TriageBucket::KbuildGuard => "KBUILD-GUARD ",
             TriageBucket::CloSocOwned => "CLO-SOC-OWNED",
             TriageBucket::HeaderWatch => "HEADER-WATCH ",
             TriageBucket::Hybrid => "HYBRID       ",
@@ -157,20 +171,22 @@ impl TriageBucket {
     pub fn advice(&self) -> &'static str {
         match self {
             TriageBucket::AckKmiGuard => "HYBRID (NEVER blind --theirs!)",
-            TriageBucket::CloSocOwned => "KEEP --ours (verify sibling .h)",
+            TriageBucket::KbuildGuard => "3-WAY MERGE (NEVER --theirs! preserves source/config/obj)",
+            TriageBucket::CloSocOwned => "KEEP --ours (verify sibling .h / replay small up-patch)",
             TriageBucket::HeaderWatch => "HYBRID (check dropped +defs)",
             TriageBucket::Hybrid => "MANUAL HYBRID",
-            TriageBucket::SafeTheirs => "TAKE --theirs",
+            TriageBucket::SafeTheirs => "TAKE --theirs (verified lossless)",
         }
     }
 
     pub fn rank(&self) -> u8 {
         match self {
             TriageBucket::AckKmiGuard => 0,
-            TriageBucket::HeaderWatch => 1,
-            TriageBucket::Hybrid => 2,
-            TriageBucket::CloSocOwned => 3,
-            TriageBucket::SafeTheirs => 4,
+            TriageBucket::KbuildGuard => 1,
+            TriageBucket::HeaderWatch => 2,
+            TriageBucket::Hybrid => 3,
+            TriageBucket::CloSocOwned => 4,
+            TriageBucket::SafeTheirs => 5,
         }
     }
 }
@@ -181,6 +197,7 @@ pub fn classify_conflict(
     ours: &str,
     theirs: &str,
     local_delta_lines: usize,
+    up_delta_lines: usize,
     up_added_hdr_syms: &[String],
 ) -> (TriageBucket, Vec<String>) {
     let mut notes = Vec::new();
@@ -191,6 +208,14 @@ pub fn classify_conflict(
             stripped_ack.iter().take(4).copied().collect::<Vec<_>>().join(", ")
         ));
         return (TriageBucket::AckKmiGuard, notes);
+    }
+
+    // Kconfig / Makefile / defconfig files with ANY local divergence must NEVER be blind `--theirs`!
+    if crate::kconfig_audit::is_kbuild_file(path) && local_delta_lines > 0 {
+        notes.push(format!(
+            "local-delta={local_delta_lines}L vs up={up_delta_lines}L (protect source/config/obj)"
+        ));
+        return (TriageBucket::KbuildGuard, notes);
     }
 
     let clo_hits = detect_clo_markers(ours, theirs);
@@ -205,6 +230,11 @@ pub fn classify_conflict(
         } else {
             notes.push("QCOM soc-repo path".to_string());
         }
+        if local_delta_lines >= 20 && local_delta_lines > 3 * up_delta_lines + 10 {
+            notes.push(format!(
+                "HUGE-LOCAL-DELTA ({local_delta_lines}L vs up {up_delta_lines}L — replay small up-patch onto --ours!)"
+            ));
+        }
         return (TriageBucket::CloSocOwned, notes);
     }
 
@@ -216,9 +246,22 @@ pub fn classify_conflict(
         return (TriageBucket::HeaderWatch, notes);
     }
 
-    if code == "UU" && local_delta_lines <= 2 {
-        notes.push("minimal local divergence".to_string());
+    // Warn loudly whenever taking `--theirs` would wipe a large local delta for a tiny upstream patch!
+    if local_delta_lines >= 20 && local_delta_lines > 3 * up_delta_lines + 10 {
+        notes.push(format!(
+            "HUGE-LOCAL-DELTA ({local_delta_lines}L vs up {up_delta_lines}L — NEVER --theirs!)"
+        ));
+        return (TriageBucket::Hybrid, notes);
+    }
+
+    // Mathematically strict SAFE-THEIRS: only when ours == base (0 local delta) so 0 lines can be lost!
+    if code == "UU" && local_delta_lines == 0 && !path.ends_with(".h") {
+        notes.push("0 local divergence (byte-identical to merge-base)".to_string());
         return (TriageBucket::SafeTheirs, notes);
+    }
+
+    if local_delta_lines > 0 && up_delta_lines > 0 {
+        notes.push(format!("local={local_delta_lines}L vs up={up_delta_lines}L"));
     }
 
     (TriageBucket::Hybrid, notes)
@@ -471,13 +514,20 @@ pub fn cmd_triage(
         let ours = git(ctx, &["show", &s2]);
         let theirs = git(ctx, &["show", &s3]);
 
-        let local_delta = if code == "UU" {
-            let d = git(ctx, &["diff", "--unified=0", &s1, &s2]);
-            d.lines()
+        let (local_delta, up_delta) = if code == "UU" {
+            let d_ours = git(ctx, &["diff", "--unified=0", &s1, &s2]);
+            let ld = d_ours
+                .lines()
                 .filter(|l| (l.starts_with('+') && !l.starts_with("+++")) || (l.starts_with('-') && !l.starts_with("---")))
-                .count()
+                .count();
+            let d_up = git(ctx, &["diff", "--unified=0", &s1, &s3]);
+            let ud = d_up
+                .lines()
+                .filter(|l| (l.starts_with('+') && !l.starts_with("+++")) || (l.starts_with('-') && !l.starts_with("---")))
+                .count();
+            (ld, ud)
         } else {
-            999
+            (999, 0)
         };
 
         let up_hdr_syms = if path.ends_with(".h") && code == "UU" {
@@ -494,7 +544,15 @@ pub fn cmd_triage(
             })
             .unwrap_or(0);
 
-        let (bucket, notes) = classify_conflict(path, code, &ours, &theirs, local_delta, &up_hdr_syms);
+        let (bucket, notes) = classify_conflict(
+            path,
+            code,
+            &ours,
+            &theirs,
+            local_delta,
+            up_delta,
+            &up_hdr_syms,
+        );
         let co_headers = if bucket == TriageBucket::CloSocOwned && path.ends_with(".c") {
             let dir = Path::new(path)
                 .parent()
@@ -526,6 +584,7 @@ pub fn cmd_triage(
 
     let n_built = rows.iter().filter(|r| r.built).count();
     let n_ack = rows.iter().filter(|r| r.bucket == TriageBucket::AckKmiGuard).count();
+    let n_kb = rows.iter().filter(|r| r.bucket == TriageBucket::KbuildGuard).count();
     let n_hdr = rows.iter().filter(|r| r.bucket == TriageBucket::HeaderWatch).count();
     let n_hyb = rows.iter().filter(|r| r.bucket == TriageBucket::Hybrid).count();
     let n_clo = rows.iter().filter(|r| r.bucket == TriageBucket::CloSocOwned).count();
@@ -538,7 +597,7 @@ pub fn cmd_triage(
         rows.len() - n_built
     );
     println!(
-        "  buckets: {n_ack} ACK-KMI-GUARD | {n_hdr} HEADER-WATCH | {n_hyb} HYBRID | {n_clo} CLO-SOC-OWNED | {n_th} SAFE-THEIRS"
+        "  buckets: {n_ack} ACK-KMI-GUARD | {n_kb} KBUILD-GUARD | {n_hdr} HEADER-WATCH | {n_hyb} HYBRID | {n_clo} CLO-SOC-OWNED | {n_th} SAFE-THEIRS"
     );
 
     let mut co_hdr_warnings: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -591,7 +650,10 @@ pub fn cmd_triage(
         .filter(|r| {
             matches!(
                 r.bucket,
-                TriageBucket::AckKmiGuard | TriageBucket::HeaderWatch | TriageBucket::Hybrid
+                TriageBucket::AckKmiGuard
+                    | TriageBucket::KbuildGuard
+                    | TriageBucket::HeaderWatch
+                    | TriageBucket::Hybrid
             )
         })
         .map(|r| r.path.as_str())
@@ -1089,6 +1151,7 @@ mod tests {
             "EXPORT_SYMBOL_GPL(security_binder_transaction);\n",
             "int foo(void) { return 0; }\n",
             20,
+            5,
             &[],
         );
         assert_eq!(b1, TriageBucket::AckKmiGuard);
@@ -1100,6 +1163,7 @@ mod tests {
             "struct qcom_scm_pas_metadata ctx;\n",
             "struct qcom_scm_pas_context ctx;\n",
             100,
+            10,
             &[],
         );
         assert_eq!(b2, TriageBucket::CloSocOwned);
@@ -1110,9 +1174,41 @@ mod tests {
             "int a;\n",
             "int b;\n",
             10,
+            5,
             &["MAX_FOLIO_ORDER".to_string()],
         );
         assert_eq!(b3, TriageBucket::HeaderWatch);
+
+        // init/Kconfig with local delta MUST be KbuildGuard (never SAFE-THEIRS!)
+        let (b4, _) = classify_conflict(
+            "init/Kconfig",
+            "UU",
+            "source \"kernel/sched/walt/Kconfig\"\n",
+            "endmenu\n",
+            2,
+            10,
+            &[],
+        );
+        assert_eq!(b4, TriageBucket::KbuildGuard);
+
+        // arm-smmu-v3.c with huge local delta vs tiny upstream patch must flag HUGE-LOCAL-DELTA
+        let (b5, notes5) = classify_conflict(
+            "drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c",
+            "UU",
+            "int a;\n",
+            "int b;\n",
+            1400,
+            6,
+            &[],
+        );
+        assert_eq!(b5, TriageBucket::CloSocOwned);
+        assert!(notes5.iter().any(|n| n.contains("HUGE-LOCAL-DELTA")));
+
+        // SAFE-THEIRS only when local_delta == 0
+        let (b6, _) = classify_conflict("fs/foo.c", "UU", "a\n", "b\n", 0, 12, &[]);
+        assert_eq!(b6, TriageBucket::SafeTheirs);
+        let (b7, _) = classify_conflict("fs/foo.c", "UU", "a\n", "b\n", 2, 12, &[]);
+        assert_eq!(b7, TriageBucket::Hybrid);
     }
 
     #[test]

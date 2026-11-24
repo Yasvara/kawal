@@ -8,6 +8,7 @@ mod dt;
 mod elf;
 mod explain;
 mod gate;
+mod kconfig_audit;
 mod lognoise;
 mod merge_intel;
 mod port;
@@ -33,8 +34,9 @@ USAGE:
 MERGE & CONFLICT TRIAGE:
   merge     <tag>                      GPG-signed merge w/ rerere=false + auto-fix bindings symlink
   merge3    <base> <theirs> [--dry-run] explicit-base 3-way merge (for squashed CLO/ACK trees!) + auto-triage
-  triage    [--apply-safe]             16-core conflict classifier (ACK-KMI-GUARD / CLO-SOC-OWNED /
-                                       HEADER-WATCH / HYBRID / SAFE-THEIRS) + co-header drift warning
+  triage    [--apply-safe]             16-core conflict classifier (ACK-KMI-GUARD / KBUILD-GUARD /
+                                       CLO-SOC-OWNED / HEADER-WATCH / HYBRID / strict SAFE-THEIRS)
+                                       + HUGE-LOCAL-DELTA & co-header drift warnings
   status                               list unmerged paths w/ [BUILT]/[unbuilt] + conflict code
   explain   [-s] [-c <sha>] [--no-hunks] [--no-patch] [files...]
                                        -s: <1s batched triage table of all conflicts (ALL-DUP/HAS-REV/MISS)
@@ -59,12 +61,18 @@ PRE-BUILD HIDDEN-MERGE GATES:
   partial   <base> <tag> [--built-only] 16-core per-commit replay (BOTH!/SPLIT/ABSENT, skips byte-identical)
   dup-scan  <base> [head] [--all]      detect dup macros/funcs/locals/structs/fallthrough-labels & lock drift
   header-drop <from> <to> [--all]      detect upstream header +defs lost via --ours but still used in HEAD
+  kconfig-audit [base] [head] [--config <f>]
+                                       live Kconfig `source`-graph reachability vs vendor fragments +
+                                       dropped `source`/`config`/`obj-$(CONFIG_*)` guard
+  merge-audit <pre> [head] [--up-base <ref> --theirs <ref>] [--all]
+                                       forensic tree-hash wipe detector (WIPED->THEIRS, DIFF-BLOAT >3x,
+                                       HELD-OURS missed-upstream-fix advisory)
   struct-loss <base> [head] [--all]    detect vanished struct fields still referenced via ->
   verify    <from> [to] [--base <ref>] [--all]
-                                       FULL 14-gate version-to-version merge verifier (merge-chain, GPG,
+                                       FULL 16-gate version-to-version merge verifier (merge-chain, GPG,
                                        markers, dup-scan, struct-loss, dangle, landmines, vendorapi,
                                        partial/absent, boot-risk, abi-audit, sem-audit, build-guard,
-                                       ack-clash, header-drop + verdict table)
+                                       ack-clash, header-drop, kconfig, merge-audit + verdict table)
   preflight [base] [--built-only] [--show-new] [--link] [--no-deps] [--no-guard] [files...]
                                        16-core REAL `clang` pre-flight check using Kbuild .o.cmd flags
                                        (+ auto new -I dirs, sibling fallback for new .c, build-guard).
@@ -245,6 +253,58 @@ fn main() {
                 2
             } else {
                 merge_intel::cmd_header_drop(&ctx, pos[0], pos[1], all)
+            }
+        }
+        "kconfig-audit" => {
+            let mut extra_cfgs: Vec<PathBuf> = Vec::new();
+            let mut pos: Vec<&str> = Vec::new();
+            let mut k = 0;
+            while k < args.len() {
+                if (args[k] == "--config" || args[k] == "-c") && k + 1 < args.len() {
+                    extra_cfgs.push(PathBuf::from(&args[k + 1]));
+                    k += 2;
+                } else {
+                    pos.push(args[k].as_str());
+                    k += 1;
+                }
+            }
+            let base = pos.first().copied();
+            let head = pos.get(1).copied().unwrap_or("HEAD");
+            kconfig_audit::cmd_kconfig_audit(&ctx, base, head, &extra_cfgs)
+        }
+        "merge-audit" => {
+            let mut all = false;
+            let mut up_base: Option<&str> = None;
+            let mut theirs: Option<&str> = None;
+            let mut pos: Vec<&str> = Vec::new();
+            let mut k = 0;
+            while k < args.len() {
+                match args[k].as_str() {
+                    "--all" => all = true,
+                    "--up-base" | "--upstream-base" if k + 1 < args.len() => {
+                        up_base = Some(args[k + 1].as_str());
+                        k += 1;
+                    }
+                    "--theirs" if k + 1 < args.len() => {
+                        theirs = Some(args[k + 1].as_str());
+                        k += 1;
+                    }
+                    other => pos.push(other),
+                }
+                k += 1;
+            }
+            if pos.is_empty() {
+                eprintln!("usage: kawal merge-audit <pre> [head] [--up-base <ref> --theirs <ref>] [--all]");
+                2
+            } else {
+                kconfig_audit::cmd_merge_audit(
+                    &ctx,
+                    pos[0],
+                    pos.get(1).copied().unwrap_or("HEAD"),
+                    up_base,
+                    theirs,
+                    all,
+                )
             }
         }
         "backport-check" => {

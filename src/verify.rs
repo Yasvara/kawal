@@ -6,6 +6,7 @@ use crate::abi;
 use crate::boot;
 use crate::buildguard;
 use crate::gate;
+use crate::kconfig_audit;
 use crate::merge_intel;
 use crate::util::*;
 
@@ -1414,6 +1415,24 @@ pub fn cmd_verify(
         let (rc_hd, hd_msg) = merge_intel::run_header_drop(ctx, f, t, all_files);
         rows.push(("header-drop", if rc_hd == 0 { "PASS" } else { "FAIL" }, hd_msg));
         if rc_hd != 0 {
+            hard_fail = true;
+        }
+        println!();
+    }
+
+    // 15. Kconfig source-graph reachability & Kbuild drop guard (catches dropped `source` / `config` / `obj-`)
+    let (rc_kc, kc_msg) = kconfig_audit::run_kconfig_audit(ctx, Some(&base), "HEAD", &[]);
+    rows.push(("kconfig", if rc_kc == 0 { "PASS" } else { "FAIL" }, kc_msg));
+    if rc_kc != 0 {
+        hard_fail = true;
+    }
+    println!();
+
+    // 16. Forensic merge-audit (`WIPED->THEIRS`, `DIFF-BLOAT`, `HELD-OURS`)
+    let (rc_ma, ma_msg) = kconfig_audit::run_merge_audit(ctx, &base, "HEAD", up_from, up_to, all_files);
+    if !ma_msg.starts_with("skipped") {
+        rows.push(("merge-audit", if rc_ma == 0 { "PASS" } else { "FAIL" }, ma_msg));
+        if rc_ma != 0 {
             hard_fail = true;
         }
         println!();

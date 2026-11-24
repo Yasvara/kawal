@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::buildguard;
 use crate::elf;
+use crate::kconfig_audit;
 use crate::util::*;
 
 /// Detect the exact Android prebuilt clang binary used by the kernel from KERNEL_OBJ/.config.
@@ -392,6 +393,7 @@ pub fn cmd_preflight(
     let mut added_hdr_dirs_by_tp: HashMap<String, BTreeSet<PathBuf>> = HashMap::new();
 
     let mut kconfig_or_caps_changed = false;
+    let mut kconfig_changed = false;
     if !explicit_files.is_empty() {
         for f in explicit_files {
             if f.ends_with(".c") {
@@ -408,7 +410,10 @@ pub fn cmd_preflight(
                 target_c.insert(f.to_string());
             } else if f.ends_with(".h") {
                 mod_headers.push(f.to_string());
-            } else if f.ends_with("Kconfig") || f == "arch/arm64/tools/cpucaps" {
+            } else if f.ends_with("Kconfig") || f.contains("/Kconfig.") || f.starts_with("Kconfig.") {
+                kconfig_or_caps_changed = true;
+                kconfig_changed = true;
+            } else if f == "arch/arm64/tools/cpucaps" {
                 kconfig_or_caps_changed = true;
             }
         }
@@ -419,6 +424,9 @@ pub fn cmd_preflight(
                 target_c.insert(f.to_string());
             } else if f.ends_with(".h") {
                 mod_headers.push(f.to_string());
+            } else if f.ends_with("Kconfig") || f.contains("/Kconfig.") || f.starts_with("Kconfig.") {
+                kconfig_or_caps_changed = true;
+                kconfig_changed = true;
             }
         }
         // Discover newly-added header directories per techpack (avoids stale .o.cmd false-fails!)
@@ -449,6 +457,9 @@ pub fn cmd_preflight(
                 target_c.insert(f.to_string());
             } else if f.ends_with(".h") {
                 mod_headers.push(f.to_string());
+            } else if f.ends_with("Kconfig") || f.contains("/Kconfig.") || f.starts_with("Kconfig.") {
+                kconfig_or_caps_changed = true;
+                kconfig_changed = true;
             }
         }
     }
@@ -580,7 +591,14 @@ pub fn cmd_preflight(
         skipped_unbuilt
     );
     if kconfig_or_caps_changed {
-        println!("  note: Kconfig/cpucaps changed since last KERNEL_OBJ build — stale autoconf.h/cpucap-defs.h may flag renamed CONFIG_*/ARM64_* macros until next make");
+        println!("  note: Kconfig/cpucaps changed since last KERNEL_OBJ build — stale autoconf.h/cpucap-defs.h may mask/flag CONFIG_*/ARM64_* macros until next make");
+    }
+    if kconfig_changed && run_guard && ctx.is_default_kernel {
+        let (rc_kc, _) = kconfig_audit::run_kconfig_audit(ctx, base, "HEAD", &[]);
+        if rc_kc != 0 {
+            guard_failed = true;
+        }
+        println!();
     }
     if jobs.is_empty() {
         println!("  nothing to check (no built .o.cmd matched)");
