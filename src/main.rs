@@ -1,4 +1,5 @@
 mod abi;
+mod backport;
 mod bloblogs;
 mod boot;
 mod buildguard;
@@ -43,9 +44,23 @@ MERGE & CONFLICT TRIAGE:
                                        default: full dossier (incoming WHY, Fixes: revert check, local
                                        divergence, 3-way :1:..:3: upstream intent, missing-symbol audit)
   dup-check [files...]                 16-core 3-way test: ALREADY-IN-HEAD vs CONTEXT-ONLY vs REAL-CONFLICT
-  backport-check <repo.git> [--apply-clean] <shas...|@file>
-                                       16-core patch status scanner (IN-LOG/ALREADY/CLEAN/CLEAN-C1/ADAPT)
-                                       with [BUILT]/[ACK]/[CLO] risk tags & optional clean auto-apply
+  backport-check <repo.git> [--apply-clean] [--no-doc] <shas...|@file>
+                                       16-core scanner (IN-LOG/ALREADY/ALREADY-CODE/CLEAN/CLEAN-NODOC/ADAPT)
+                                       with [BUILT]/[ACK]/[CLO], MOVED-FN, NO-FN & SERIES-DEP detection
+  backport-apply <repo.git> [--no-doc] [--no-sign] [--stop-on-conflict] <shas...|@file>
+                                       sequential GPG-signed batch applier (auto-skips ALREADY-CODE,
+                                       strips doc-only conflicts, appends upstream SHA footer)
+  backport-ctx   <repo.git> [--ctx N] [--all-hunks] [--doc] <shas...|@file>
+                                       token-saving surgical conflict inspector: collapses clean/dup hunks,
+                                       locates moved funcs, surfaces prereqs, vendor hooks & missing symbols
+  backport-stage <repo.git> <sha> [--ctx N] [--doc]
+                                       apply all clean hunks into working tree, skip dups, and print ONLY
+                                       remaining conflict hunks + local lines + prereq hints to hand-edit
+  backport-commit <repo.git> <sha> [--no-sign] [--allow-hook-drop] [-- <files...>]
+                                       1-line GPG-signed BACKPORT commit preserving upstream author/date/SHA
+                                       with built-in vendor-hook / EXPORT_SYMBOL deletion guard
+  backport-search <repo.git> <pattern> [--range R] [-n N] [-- <paths...>]
+                                       find upstream commits matching pattern, deduplicated vs local HEAD
   why       <sym|sha|file:L[-E]> [paths...] [-n N]
                                        fast git archaeology: WHY merged, reverted, dropped, or changed
   flow      <symbol> [paths...] [--no-struct]
@@ -309,19 +324,128 @@ fn main() {
         }
         "backport-check" => {
             let mut apply_clean = false;
+            let mut no_doc = false;
             let mut pos: Vec<String> = Vec::new();
             for a in args {
-                if a == "--apply-clean" {
-                    apply_clean = true;
+                match a.as_str() {
+                    "--apply-clean" => apply_clean = true,
+                    "--no-doc" => no_doc = true,
+                    _ => pos.push(a.clone()),
+                }
+            }
+            if pos.len() < 2 {
+                eprintln!("usage: kawal backport-check <upstream.git> [--apply-clean] [--no-doc] <shas...|@file>");
+                2
+            } else {
+                backport::cmd_backport_check(&ctx, &pos[0], &pos[1..], apply_clean, no_doc)
+            }
+        }
+        "backport-apply" => {
+            let mut no_doc = false;
+            let mut sign = true;
+            let mut stop_on_conflict = false;
+            let mut pos: Vec<String> = Vec::new();
+            for a in args {
+                match a.as_str() {
+                    "--no-doc" => no_doc = true,
+                    "--no-sign" => sign = false,
+                    "--stop-on-conflict" => stop_on_conflict = true,
+                    _ => pos.push(a.clone()),
+                }
+            }
+            if pos.len() < 2 {
+                eprintln!("usage: kawal backport-apply <upstream.git> [--no-doc] [--no-sign] [--stop-on-conflict] <shas...|@file>");
+                2
+            } else {
+                backport::cmd_backport_apply(&ctx, &pos[0], &pos[1..], no_doc, sign, stop_on_conflict)
+            }
+        }
+        "backport-ctx" | "backport-stage" => {
+            let stage_ok = cmd == "backport-stage";
+            let mut ctx_lines = 10usize;
+            let mut all_hunks = false;
+            let mut include_doc = false;
+            let mut pos: Vec<String> = Vec::new();
+            let mut k = 0;
+            while k < args.len() {
+                match args[k].as_str() {
+                    "--ctx" if k + 1 < args.len() => {
+                        ctx_lines = args[k + 1].parse().unwrap_or(10);
+                        k += 1;
+                    }
+                    "--all-hunks" => all_hunks = true,
+                    "--doc" => include_doc = true,
+                    other => pos.push(other.to_string()),
+                }
+                k += 1;
+            }
+            if pos.len() < 2 {
+                eprintln!("usage: kawal {cmd} <upstream.git> [--ctx N] [--all-hunks] [--doc] <shas...|@file>");
+                2
+            } else {
+                backport::cmd_backport_ctx(&ctx, &pos[0], &pos[1..], ctx_lines, all_hunks, include_doc, stage_ok)
+            }
+        }
+        "backport-commit" => {
+            let mut sign = true;
+            let mut allow_hook_drop = false;
+            let mut pos: Vec<String> = Vec::new();
+            let mut files: Vec<String> = Vec::new();
+            let mut in_files = false;
+            for a in args {
+                if in_files {
+                    files.push(a.clone());
+                } else if a == "--" {
+                    in_files = true;
+                } else if a == "--no-sign" {
+                    sign = false;
+                } else if a == "--allow-hook-drop" {
+                    allow_hook_drop = true;
                 } else {
                     pos.push(a.clone());
                 }
             }
             if pos.len() < 2 {
-                eprintln!("usage: kawal backport-check <upstream.git> [--apply-clean] <shas...|@file>");
+                eprintln!("usage: kawal backport-commit <upstream.git> <sha> [--no-sign] [--allow-hook-drop] [-- <files...>]");
                 2
             } else {
-                merge_intel::cmd_backport_check(&ctx, &pos[0], &pos[1..], apply_clean)
+                if pos.len() > 2 && files.is_empty() {
+                    files.extend(pos[2..].iter().cloned());
+                }
+                backport::cmd_backport_commit(&ctx, &pos[0], &pos[1], &files, sign, allow_hook_drop)
+            }
+        }
+        "backport-search" => {
+            let mut range = "v6.12..v6.18.65".to_string();
+            let mut limit = 25usize;
+            let mut pos: Vec<String> = Vec::new();
+            let mut paths: Vec<String> = Vec::new();
+            let mut in_paths = false;
+            let mut k = 0;
+            while k < args.len() {
+                if in_paths {
+                    paths.push(args[k].clone());
+                } else {
+                    match args[k].as_str() {
+                        "--" => in_paths = true,
+                        "--range" if k + 1 < args.len() => {
+                            range = args[k + 1].clone();
+                            k += 1;
+                        }
+                        "-n" if k + 1 < args.len() => {
+                            limit = args[k + 1].parse().unwrap_or(25);
+                            k += 1;
+                        }
+                        other => pos.push(other.to_string()),
+                    }
+                }
+                k += 1;
+            }
+            if pos.len() < 2 {
+                eprintln!("usage: kawal backport-search <upstream.git> <pattern> [--range R] [-n N] [-- <paths...>]");
+                2
+            } else {
+                backport::cmd_backport_search(&ctx, &pos[0], &pos[1], &range, &paths, limit)
             }
         }
         "status" => gate::cmd_status(&ctx),

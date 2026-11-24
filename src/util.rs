@@ -319,7 +319,30 @@ pub fn is_built_file(ctx: &Ctx, path: &str) -> bool {
         return true;
     }
     if let Some(stem) = path.strip_suffix(".c") {
-        return ctx.kernel_obj.join(format!("{stem}.o")).is_file();
+        if ctx.kernel_obj.join(format!("{stem}.o")).is_file() {
+            return true;
+        }
+        // Unity-build `.c` files (e.g. kernel/sched/topology.c included by build_utility.c)
+        let p = Path::new(path);
+        if let (Some(dir), Some(fname)) = (p.parent(), p.file_name().and_then(|s| s.to_str())) {
+            let needle = format!("\"{fname}\"");
+            if let Ok(rd) = fs::read_dir(ctx.repo.join(dir)) {
+                for ent in rd.flatten() {
+                    let bn = ent.file_name().to_string_lossy().into_owned();
+                    if bn.starts_with("build_") && bn.ends_with(".c") {
+                        let ustem = bn.trim_end_matches(".c");
+                        if ctx.kernel_obj.join(dir).join(format!("{ustem}.o")).is_file() {
+                            if let Ok(txt) = fs::read_to_string(ent.path()) {
+                                if txt.contains(&needle) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
     }
     if path.ends_with(".h") {
         if path.starts_with("include/") || path.starts_with("arch/arm64/") {
