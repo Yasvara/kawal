@@ -1564,7 +1564,7 @@ fn bytes_to_ascii_lines(buf: &[u8]) -> String {
 
 pub fn cmd_crash_log(ctx: &Ctx, requested_serial: Option<&str>, max_slots: usize) -> i32 {
     println!("========================================================================");
-    println!("ktool crash-log: pstore + shutdown-checkpoints + blackbox + mtdoops");
+    println!("kawal crash-log: pstore + checkpoints + blackbox + mtdoops + rawdump + live GPU/tombstones");
     println!("========================================================================");
     let dev = match device::select_adb_device(ctx, requested_serial) {
         Ok(d) => d,
@@ -1646,7 +1646,7 @@ echo '@@SEC:END@@'
     println!("  current  : boot_index={cur_bi} pureason={cur_pu}");
 
     // [1] pstore
-    println!("\n[1/4] /sys/fs/pstore (ramoops across warm-reset panics):");
+    println!("\n[1/6] /sys/fs/pstore (ramoops across warm-reset panics):");
     let pstore_raw = secs.get("PSTORE").map(|s| s.as_str()).unwrap_or("").trim();
     let mut saw_panic = false;
     if pstore_raw.is_empty() {
@@ -1663,7 +1663,7 @@ echo '@@SEC:END@@'
     }
 
     // [2] shutdown-checkpoints
-    println!("\n[2/4] /data/system/shutdown-checkpoints (recent clean userspace reboots):");
+    println!("\n[2/6] /data/system/shutdown-checkpoints (recent clean userspace reboots):");
     let shut_raw = secs.get("SHUTDOWN").map(|s| s.as_str()).unwrap_or("").trim();
     if shut_raw.is_empty() {
         println!("  (none)");
@@ -1679,7 +1679,7 @@ echo '@@SEC:END@@'
     }
 
     // [3] blackbox headers (pulled compact 64 KiB/slot binary — decoded in pure Rust!)
-    println!("\n[3/4] /dev/block/by-name/blackbox (first {slots} x 8 MiB slot headers):");
+    println!("\n[3/6] /dev/block/by-name/blackbox (first {slots} x 8 MiB slot headers):");
     let host_bb = std::env::temp_dir().join(format!("ktool_bb_{}.bin", std::process::id()));
     let host_bb_s = host_bb.to_string_lossy().into_owned();
     let (rc_bb, _, _) = run_cmd("adb", &["-s", serial, "pull", tmp_bb, &host_bb_s], &ctx.ws_root, None);
@@ -1715,7 +1715,7 @@ echo '@@SEC:END@@'
     }
 
     // [4] mtdoops (fast adb pull of 16 MiB dump + immediate cleanup + pure-Rust decoder)
-    println!("\n[4/4] /dev/block/by-name/oops (mtdoops 2 MiB slots decoded in Rust):");
+    println!("\n[4/6] /dev/block/by-name/oops (mtdoops 2 MiB slots decoded in Rust):");
     let tmp_host = std::env::temp_dir().join(format!("ktool_oops_{}.bin", std::process::id()));
     let host_s = tmp_host.to_string_lossy().into_owned();
     let (rc_pull, _, err_pull) = run_cmd("adb", &["-s", serial, "pull", tmp_oops, &host_s], &ctx.ws_root, None);
@@ -1752,9 +1752,64 @@ echo '@@SEC:END@@'
         }
     }
 
+    // [5] Qualcomm rawdump / minidump summary (HYP_DIAG + SMMUv2 + RST_STAT + PMIC PLOG)
+    println!("\n[5/6] /dev/block/by-name/rawdump (Qualcomm Minidump / Gunyah EL2 / SMMU / PMIC):");
+    if crate::rawdump::probe_rawdump_summary_for_crash_log(ctx, serial) {
+        saw_panic = true;
+    }
+
+    // [6] Live kernel GPU faults + recent tombstones (non-reboot crashes!)
+    println!("\n[6/6] Live GPU Faults (dmesg) & Latest Tombstones (current boot):");
+    let live_probe = r#"LC_ALL=C
+echo '@@SEC:GPUF@@'
+dmesg 2>/dev/null | grep -E 'RBBM: GPC|GPU PAGE FAULT|Unhandled context fault|kgsl-3d0: Fault|Kernel panic|kernel BUG at|Internal error:|WARNING: CPU:|(^|[^A-Za-z0-9_])(BUG|Oops):' | tail -n 12
+echo '@@SEC:TOMB@@'
+for f in $(ls -1t /data/tombstones/tombstone_* 2>/dev/null | grep -v '\.pb$' | head -n 4); do
+  [ -f "$f" ] || continue
+  echo "@@TF:$f@@"
+  grep -m4 -E 'Timestamp:|Cmdline:|signal |#00 pc' "$f" 2>/dev/null
+done
+"#;
+    if let Ok(lp) = device::run_adb_probe(ctx, serial, live_probe) {
+        let mut sec = "";
+        let mut gpuf = Vec::new();
+        let mut tomb = Vec::new();
+        for ln in lp.lines() {
+            if let Some(s) = ln.strip_prefix("@@SEC:").and_then(|x| x.strip_suffix("@@")) {
+                sec = s;
+            } else if !ln.trim().is_empty() {
+                match sec {
+                    "GPUF" => gpuf.push(ln),
+                    "TOMB" => tomb.push(ln),
+                    _ => {}
+                }
+            }
+        }
+        if gpuf.is_empty() {
+            println!("  live_gpu : clean (0 RBBM/KGSL/SMMU/BUG lines in current dmesg)");
+        } else {
+            println!("  live_gpu : {} fault line(s):", gpuf.len());
+            for g in &gpuf {
+                println!("    [!] {}", truncate_str(g, 115));
+            }
+        }
+        if tomb.is_empty() {
+            println!("  tombstone: (none)");
+        } else {
+            for t in &tomb {
+                if let Some(f) = t.strip_prefix("@@TF:").and_then(|x| x.strip_suffix("@@")) {
+                    let bn = Path::new(f).file_name().unwrap_or_default().to_string_lossy();
+                    println!("  {bn}:");
+                } else {
+                    println!("    {}", truncate_str(t.trim(), 160));
+                }
+            }
+        }
+    }
+
     println!(
         "\nCRASH-LOG SUMMARY: {}",
-        if saw_panic { "PANIC / RAMOOPS RECORDED (inspect above)" } else { "NO ACTIVE PANIC FOUND" }
+        if saw_panic { "FATAL / HARD-RESET / PANIC RECORDED (inspect above)" } else { "NO ACTIVE PANIC FOUND" }
     );
     0
 }

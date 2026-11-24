@@ -15,6 +15,7 @@ mod lognoise;
 mod merge_intel;
 mod port;
 mod preflight;
+mod rawdump;
 mod romops;
 mod runtime_audit;
 mod search;
@@ -113,7 +114,11 @@ PRE-BUILD HIDDEN-MERGE GATES:
                                        ELF64 .ko audit (vermagic, depends=, symbols, CRCs, boot-order,
                                        modules.load*), .config/LTO/symvers hygiene, & build log scan
   live-audit [-s <serial>] [--full]    POST-FLASH adb kernel check (--full runs full `kawal health`)
-  crash-log [-s <serial>] [--slots N]  decode /sys/fs/pstore, shutdown-checkpoints, blackbox & mtdoops slots
+  crash-log [-s <serial>] [--slots N]  decode pstore, shutdown-checkpoints, blackbox, mtdoops, rawdump & recent GPU/tombstones
+  rawdump   [-s <serial>|--file <bin>] [--save <dir>] [--vmlinux <elf>] [--tail N] [--list] [--full]
+                                       pure-Rust Qualcomm Minidump (`Raw_Dmp!` v2) decoder: Gunyah EL2 HYP_DIAG +
+                                       ARM SMMUv2 bitfield decoder, PMIC PLOG, Linux 6.12 printk_ringbuffer,
+                                       Android pmsg logcat, KASLR/kstate/watchdog/vCPU symbolizer & KGSL eventlog
   health    [-s <serial>] [--only <secs>] [--full] [--dump-avc] [--json]
                                        single-shot full ADB device health audit (identity, kernel,
                                        HALs/services/restart-loops, boot-scoped crashes/ANRs,
@@ -804,6 +809,48 @@ fn main() {
                 }
             }
             boot::cmd_crash_log(&ctx, serial.as_deref(), slots)
+        }
+        "rawdump" | "minidump" => {
+            let mut opts = rawdump::RawDumpOpts::default();
+            let mut k = 0;
+            while k < args.len() {
+                match args[k].as_str() {
+                    "-s" | "--serial" if k + 1 < args.len() => {
+                        opts.serial = Some(args[k + 1].clone());
+                        k += 2;
+                    }
+                    "-f" | "--file" if k + 1 < args.len() => {
+                        opts.file = Some(args[k + 1].clone());
+                        k += 2;
+                    }
+                    "--save" | "-o" if k + 1 < args.len() => {
+                        opts.save_dir = Some(args[k + 1].clone());
+                        k += 2;
+                    }
+                    "--vmlinux" if k + 1 < args.len() => {
+                        opts.vmlinux = Some(args[k + 1].clone());
+                        k += 2;
+                    }
+                    "--tail" | "-n" if k + 1 < args.len() => {
+                        opts.tail = args[k + 1].parse().unwrap_or(25);
+                        k += 2;
+                    }
+                    "--list" | "--toc" => {
+                        opts.list_sections = true;
+                        k += 1;
+                    }
+                    "--full" | "-v" | "--verbose" => {
+                        opts.full = true;
+                        k += 1;
+                    }
+                    other if !other.starts_with('-') && opts.file.is_none() => {
+                        opts.file = Some(other.to_string());
+                        k += 1;
+                    }
+                    _ => k += 1,
+                }
+            }
+            rawdump::cmd_rawdump(&ctx, &opts)
         }
         "health" => {
             let mut opts = device::HealthOpts::default();

@@ -10,7 +10,7 @@
   - 16-core `backport-check` (`IN-LOG`/`ALREADY`/`CLEAN`/`CLEAN-C1`/`ADAPT` with `[BUILT]`/`[ACK]`/`[CLO]` risk tags and `--apply-clean`) and real `clang` `preflight` (`--built-only`, `--link` ELF64 MODPOST symbol check, auto `kconfig-audit` whenever `Kconfig` changes).
 - **Major kernel porting (`port delta`, `port api-scan`, `port kabi-check`, `port overlay-soc`, `port bzl2config`, `port build-diag`)**: Preprocessor-aware breaking-API scanner (6.6 → 6.12 / 6.18), regression guards, and build-log root-cause triage.
 - **Devicetree & post-build image safety (`dt-check`, `img-audit`)**: Real `dtc` + `fdtoverlay` + merged-DTB hardware audit (reserved-memory overlaps, regulator bounds, bootargs), plus pure-Rust ELF64 `.ko` binary auditing (vermagic, `depends=`, `SHN_UNDEF`, `__versions` CRCs, partition load order, recovery ramdisk DRM sync, AVB footer, `.config` + LTO/Rust hygiene).
-- **Live hardware & crash forensics (`live-audit`, `health`, `runtime-audit`, `crash-log`, `log-noise`, `blob-logs`)**: Single-shot ADB kernel health check, idle CPU/IRQ/slab/vmalloc/DMA-BUF/FD leak hunting with JSON baseline diffs, and pure-Rust decoding of `/sys/fs/pstore`, `shutdown-checkpoints`, `blackbox`, and `mtdoops` partitions.
+- **Live hardware & crash forensics (`live-audit`, `health`, `runtime-audit`, `crash-log`, `rawdump`, `log-noise`, `blob-logs`)**: Single-shot ADB kernel health check, idle CPU/IRQ/slab/vmalloc/DMA-BUF/FD leak hunting with JSON baseline diffs, and pure-Rust decoding of `/sys/fs/pstore`, `shutdown-checkpoints`, `blackbox`, `mtdoops`, live GPU faults/tombstones, and Qualcomm `Raw_Dmp!` v2 minidumps (`/dev/block/by-name/rawdump` — Gunyah EL2 `HYP_DIAG` + ARM SMMUv2 register decoder, PMIC PON `PLOG` history, Linux 6.12 `printk_ringbuffer` dmesg, Android binary `pmsg` logcat, KASLR/vCPU symbolizer, and Adreno KGSL eventlog).
 - **ROM & upstream sync (`sync latest|fetch|status|plan|apply|merge`, `prebuilts`, `hygiene`, `push`)**: Parallel CLO/AOSP/ACK (Gitiles `Makefile` version probe)/LineageOS/Linux LTS (automatic GitHub mirror fallback) tracking and safe GPG-signed merges.
 
 ## Installation
@@ -35,6 +35,7 @@ kawal dt-check
 kawal img-audit
 kawal live-audit -s <serial>
 kawal crash-log -s <serial>
+kawal rawdump -s <serial> --save ./rawdump-decoded
 kawal runtime-audit -s <serial> --window 5 --full
 ```
 
