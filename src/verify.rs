@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 
 use crate::abi;
 use crate::boot;
 use crate::buildguard;
 use crate::gate;
+use crate::merge_intel;
 use crate::util::*;
 
 // ------------------------------------------------------------ range helpers
@@ -64,33 +66,56 @@ fn check_merge_chain(ctx: &Ctx, from: Option<&str>, to: Option<&str>, base: &str
     // 1a. Verify intermediate version tags if from/to share prefix (e.g. v6.6.152 -> v6.6.162)
     let mut tag_info = String::new();
     if let (Some(f), Some(t)) = (from, to) {
-        if !is_ancestor(ctx, t, "HEAD") {
-            println!("  !! TARGET NOT MERGED: {t} is NOT an ancestor of HEAD");
-            issues += 1;
-        }
-        if let (Some((pf, nf)), Some((pt, nt))) = (parse_ver_tag(f), parse_ver_tag(t)) {
-            if pf == pt && nt > nf && nt - nf <= 200 {
-                let mut total = 0usize;
-                let mut merged = 0usize;
-                let mut missing = Vec::new();
-                for n in (nf + 1)..=nt {
-                    let tg = format!("{pf}{n}");
-                    if ref_exists(ctx, &tg) {
-                        total += 1;
-                        if is_ancestor(ctx, &tg, "HEAD") {
-                            merged += 1;
-                        } else {
-                            missing.push(tg);
+        let head_mk_ver = fs::read_to_string(ctx.repo.join("Makefile"))
+            .ok()
+            .and_then(|txt| {
+                let (mut v, mut p, mut s) = (String::new(), String::new(), String::new());
+                for ln in txt.lines().take(15) {
+                    let tr = ln.trim();
+                    if let Some(x) = tr.strip_prefix("VERSION =") { v = x.trim().to_string(); }
+                    else if let Some(x) = tr.strip_prefix("PATCHLEVEL =") { p = x.trim().to_string(); }
+                    else if let Some(x) = tr.strip_prefix("SUBLEVEL =") { s = x.trim().to_string(); }
+                }
+                if !v.is_empty() && !p.is_empty() && !s.is_empty() {
+                    Some(format!("v{v}.{p}.{s}"))
+                } else {
+                    None
+                }
+            });
+        let single_parent_merge3 = !is_ancestor(ctx, t, "HEAD")
+            && head_mk_ver.as_deref() == Some(t);
+        if single_parent_merge3 {
+            println!("  merge3: HEAD Makefile matches {t} (single-parent 3-way merge)");
+            tag_info = format!("merge3={t}");
+        } else {
+            if !is_ancestor(ctx, t, "HEAD") {
+                println!("  !! TARGET NOT MERGED: {t} is NOT an ancestor of HEAD");
+                issues += 1;
+            }
+            if let (Some((pf, nf)), Some((pt, nt))) = (parse_ver_tag(f), parse_ver_tag(t)) {
+                if pf == pt && nt > nf && nt - nf <= 200 {
+                    let mut total = 0usize;
+                    let mut merged = 0usize;
+                    let mut missing = Vec::new();
+                    for n in (nf + 1)..=nt {
+                        let tg = format!("{pf}{n}");
+                        if ref_exists(ctx, &tg) {
+                            total += 1;
+                            if is_ancestor(ctx, &tg, "HEAD") {
+                                merged += 1;
+                            } else {
+                                missing.push(tg);
+                            }
                         }
                     }
+                    if !missing.is_empty() {
+                        println!("  !! MISSING INTERMEDIATE TAGS: {}", missing.join(", "));
+                        issues += missing.len();
+                    } else if total > 0 {
+                        println!("  tags: {merged}/{total} intermediate tags ({pf}{}..{pf}{nt}) are ancestors of HEAD", nf + 1);
+                    }
+                    tag_info = format!("{merged}/{total} tags");
                 }
-                if !missing.is_empty() {
-                    println!("  !! MISSING INTERMEDIATE TAGS: {}", missing.join(", "));
-                    issues += missing.len();
-                } else if total > 0 {
-                    println!("  tags: {merged}/{total} intermediate tags ({pf}{}..{pf}{nt}) are ancestors of HEAD", nf + 1);
-                }
-                tag_info = format!("{merged}/{total} tags");
             }
         }
     }
@@ -167,13 +192,16 @@ fn check_merge_chain(ctx: &Ctx, from: Option<&str>, to: Option<&str>, base: &str
         issues += junk.len();
     }
     if ctx.is_default_kernel {
-        let bp = ctx.repo.join(BINDINGS);
-        let ok_link = fs::symlink_metadata(&bp)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if !ok_link {
-            println!("  !! BROKEN SYMLINK: {BINDINGS} is not a symlink");
-            issues += 1;
+        let base_bindings = git(ctx, &["ls-tree", base, BINDINGS]);
+        if base_bindings.starts_with("120000 ") {
+            let bp = ctx.repo.join(BINDINGS);
+            let ok_link = fs::symlink_metadata(&bp)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if !ok_link {
+                println!("  !! BROKEN SYMLINK: {BINDINGS} is not a symlink");
+                issues += 1;
+            }
         }
     }
 
@@ -321,7 +349,7 @@ fn is_candidate_dup_stmt(trim: &str) -> bool {
     // Skip pop/consume/next style calls where repeating twice is intentional
     for ok_rep in [
         "_next(", "_pop(", "_pop_", "consume_", "advance_", "skip_", "read_", "write_",
-        "put_", "get_", "kfree(", "fput(", "dput(", "iput(", "kref_put(", "pop_",
+        "put_", "_put(", "get_", "kfree(", "fput(", "dput(", "iput(", "kref_put(", "pop_",
         "push_", "emit_", "append_", "add_tail", "add_head", "wait_for_", "schedule(",
         "cond_resched(", "yield(", "flush_", "drain_", "sync_",
     ] {
@@ -336,7 +364,263 @@ struct DupScanFileHit {
     dup_macros: Vec<String>,
     dup_funcs: Vec<String>,
     dup_stmts: Vec<String>,
+    dup_labels: Vec<String>,
+    dup_locals: Vec<String>,
+    macro_shadows: Vec<String>,
+    added_structs: Vec<(String, String, usize)>,
     lock_regressions: Vec<String>,
+}
+
+/// Detect fallthrough error-cleanup labels executing the exact same cleanup statement twice!
+/// Catches silent merge bugs like:
+///   err_del_dev:
+///       device_del(&mhi_cntrl->mhi_dev->dev);
+///   err_release_dev:
+///       device_del(&mhi_cntrl->mhi_dev->dev);
+fn is_c_goto_label(trim: &str) -> bool {
+    let Some(name) = trim.strip_suffix(':') else {
+        return false;
+    };
+    if name.is_empty()
+        || name == "default"
+        || name.starts_with("case ")
+        || name.contains(' ')
+        || name.contains('\t')
+        || name.contains('(')
+        || name.contains('?')
+    {
+        return false;
+    }
+    let b = name.as_bytes();
+    is_ident_start(b[0]) && b.iter().all(|&c| is_ident_char(c))
+}
+
+pub(crate) fn scan_dup_fallthrough_labels(
+    path: &str,
+    lines: &[&str],
+    added: &HashSet<usize>,
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let trim = strip_c_comments(lines[idx]).trim();
+        if !is_c_goto_label(trim) {
+            idx += 1;
+            continue;
+        }
+        let lbl1 = trim;
+        // Collect first non-empty cleanup statements under lbl1 (up to 4 lines) until next label or control transfer
+        let mut stmts1: Vec<(usize, String)> = Vec::new();
+        let mut next_lbl_idx: Option<usize> = None;
+        let mut broke = false;
+        let mut j = idx + 1;
+        while j < lines.len() && j <= idx + 6 {
+            let t = strip_c_comments(lines[j]).trim();
+            if t.is_empty() || t.starts_with('#') {
+                j += 1;
+                continue;
+            }
+            if is_c_goto_label(t) {
+                next_lbl_idx = Some(j);
+                break;
+            }
+            if t.starts_with("return")
+                || t.starts_with("goto ")
+                || t.starts_with("break;")
+                || t.starts_with("continue;")
+                || t.starts_with('}')
+            {
+                broke = true;
+                break;
+            }
+            if t.ends_with(';') && t.len() >= 10 && t.contains('(') {
+                stmts1.push((j + 1, t.to_string()));
+            }
+            j += 1;
+        }
+        if !broke && !stmts1.is_empty() {
+            if let Some(l2_idx) = next_lbl_idx {
+                let lbl2 = strip_c_comments(lines[l2_idx]).trim();
+                let mut k = l2_idx + 1;
+                while k < lines.len() && k <= l2_idx + 5 {
+                    let t2 = strip_c_comments(lines[k]).trim();
+                    if t2.is_empty() || t2.starts_with('#') {
+                        k += 1;
+                        continue;
+                    }
+                    if is_c_goto_label(t2)
+                        || t2.starts_with("return")
+                        || t2.starts_with("goto ")
+                        || t2.starts_with('}')
+                    {
+                        break;
+                    }
+                    let lno2 = k + 1;
+                    if let Some((lno1, _)) = stmts1.iter().find(|(_, s)| s == t2) {
+                        if added.contains(lno1) || added.contains(&lno2) {
+                            hits.push(format!(
+                                "{path}:L{lno1}/L{lno2}: fallthrough {lbl1} -> {lbl2} repeats `{}`",
+                                truncate_str(t2, 72)
+                            ));
+                        }
+                    }
+                    k += 1;
+                }
+            }
+        }
+        idx += 1;
+    }
+    hits
+}
+
+/// Parse a simple local variable declaration at function top level (`\tint i;`, `\tu32 val = 0;`, `\tstruct foo *p;`).
+fn parse_simple_local_var(raw: &str) -> Option<String> {
+    // Only single-tab indented top-level function locals
+    if !raw.starts_with('\t') || raw.starts_with("\t\t") {
+        return None;
+    }
+    let code = strip_c_comments(raw).trim();
+    if !code.ends_with(';') || code.contains('(') || code.contains(',') || code.starts_with("static ") || code.starts_with("extern ") || code.starts_with("typedef ") {
+        return None;
+    }
+    // Strip `= init` if present
+    let lhs = code.trim_end_matches(';').split('=').next()?.trim();
+    let toks: Vec<&str> = lhs.split_whitespace().collect();
+    if toks.len() < 2 {
+        return None;
+    }
+    let first = toks[0];
+    let is_type_start = matches!(
+        first,
+        "int"
+            | "unsigned"
+            | "signed"
+            | "long"
+            | "short"
+            | "char"
+            | "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "s8"
+            | "s16"
+            | "s32"
+            | "s64"
+            | "size_t"
+            | "ssize_t"
+            | "loff_t"
+            | "phys_addr_t"
+            | "dma_addr_t"
+            | "gfp_t"
+            | "irqreturn_t"
+            | "struct"
+            | "enum"
+            | "const"
+    );
+    if !is_type_start {
+        return None;
+    }
+    let last = toks.last()?.trim_start_matches('*');
+    if last.is_empty() || last.contains('[') || last.contains(']') {
+        return None;
+    }
+    let b = last.as_bytes();
+    if !is_ident_start(b[0]) || !b.iter().all(|&c| is_ident_char(c)) {
+        return None;
+    }
+    if C_KEYWORDS.contains(&last) {
+        return None;
+    }
+    Some(last.to_string())
+}
+
+/// Detect duplicate local variable declarations in the same function & preprocessor branch (e.g. `int i; ... int i;`).
+pub(crate) fn scan_dup_local_decls(
+    path: &str,
+    lines: &[&str],
+    added: &HashSet<usize>,
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    let mut brace_depth = 0i32;
+    let mut bstack: Vec<(usize, usize)> = Vec::new();
+    let mut ng = 1usize;
+    let mut seen: HashMap<(String, Vec<(usize, usize)>), usize> = HashMap::new();
+    let mut in_blk = false;
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let lno = idx + 1;
+        let t = raw.trim();
+        if in_blk {
+            if t.contains("*/") {
+                in_blk = false;
+            }
+            continue;
+        }
+        if t.starts_with("/*") && !t.contains("*/") {
+            in_blk = true;
+            continue;
+        }
+        if let Some(ah) = t.strip_prefix('#') {
+            let d = ah.trim_start();
+            if d.starts_with("if ") || d.starts_with("if(") || d.starts_with("ifdef") || d.starts_with("ifndef") {
+                bstack.push((ng, 0));
+                ng += 1;
+            } else if d.starts_with("elif") || d.starts_with("else") {
+                if let Some(top) = bstack.last_mut() {
+                    top.1 += 1;
+                }
+            } else if d.starts_with("endif") {
+                bstack.pop();
+            }
+            continue;
+        }
+
+        let code = strip_c_comments(raw);
+        let opens = code.bytes().filter(|&c| c == b'{').count() as i32;
+        let closes = code.bytes().filter(|&c| c == b'}').count() as i32;
+
+        if brace_depth == 1 && opens == 0 && closes == 0 {
+            if let Some(vname) = parse_simple_local_var(raw) {
+                let key = (vname.clone(), bstack.clone());
+                if let Some(&prev) = seen.get(&key) {
+                    if added.contains(&lno) || added.contains(&prev) {
+                        hits.push(format!(
+                            "{path}:L{prev} & L{lno}: duplicate local declaration `{vname}`"
+                        ));
+                    }
+                } else {
+                    seen.insert(key, lno);
+                }
+            }
+        }
+
+        let prev_depth = brace_depth;
+        brace_depth = (brace_depth + opens - closes).max(0);
+        if (prev_depth == 0 && brace_depth == 1) || brace_depth == 0 {
+            seen.clear();
+        }
+    }
+    hits
+}
+
+/// Extract col-0 `struct <name> {` definition name from a `.c` line.
+fn parse_col0_struct_def(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix("struct ")?;
+    let mut i = 0;
+    let b = rest.as_bytes();
+    while i < b.len() && is_ident_char(b[i]) {
+        i += 1;
+    }
+    if i < 5 {
+        return None;
+    }
+    let after = strip_c_comments(&rest[i..]).trim();
+    if after == "{" {
+        Some(rest[..i].to_string())
+    } else {
+        None
+    }
 }
 
 const LOCK_PAIRS: &[(&str, &str, &str)] = &[
@@ -431,6 +715,10 @@ fn run_dup_scan(
             dup_macros: Vec::new(),
             dup_funcs: Vec::new(),
             dup_stmts: Vec::new(),
+            dup_labels: Vec::new(),
+            dup_locals: Vec::new(),
+            macro_shadows: Vec::new(),
+            added_structs: Vec::new(),
             lock_regressions: Vec::new(),
         };
         let full = ctx.repo.join(path);
@@ -442,6 +730,42 @@ fn run_dup_scan(
             None => return hit,
         };
         let lines: Vec<&str> = text.lines().collect();
+
+        // Collect sibling header macro aliases for `.c` files (catches CLO macro-aliased functions!)
+        let mut sibling_macro_aliases: HashMap<String, String> = HashMap::new();
+        if path.ends_with(".c") {
+            if let Some(dir) = full.parent() {
+                if let Ok(rd) = fs::read_dir(dir) {
+                    for ent in rd.flatten() {
+                        let p = ent.path();
+                        if p.extension().and_then(|e| e.to_str()) == Some("h") {
+                            if let Ok(htxt) = fs::read_to_string(&p) {
+                                let hname = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                                for hln in htxt.lines() {
+                                    let t = hln.trim();
+                                    if let Some(ah) = t.strip_prefix('#') {
+                                        if let Some(rest) = ah.trim_start().strip_prefix("define") {
+                                            if rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+                                                let parts: Vec<&str> = rest.split_whitespace().collect();
+                                                // Object-like alias `#define foo bar` (no `(` attached to foo)
+                                                if parts.len() == 2
+                                                    && !parts[0].contains('(')
+                                                    && parts[0].len() >= 8
+                                                    && parts[0].bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                                                    && parts[1].bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                                                {
+                                                    sibling_macro_aliases.insert(parts[0].to_string(), format!("{hname} -> {}", parts[1]));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // 2a. Duplicate #define in same preprocessor branch (where >=1 was added in base..head)
         let mut branch_stack: Vec<(usize, usize)> = Vec::new();
@@ -544,6 +868,13 @@ fn run_dup_scan(
                     let fname = &before[i..];
                     let left = before[..i].trim();
                     if !left.is_empty() && fname.len() >= 4 && !C_KEYWORDS.contains(&fname) && !NOT_A_CALL.contains(&fname) {
+                        if added.contains(&lno) {
+                            if let Some(alias_info) = sibling_macro_aliases.get(fname) {
+                                hit.macro_shadows.push(format!(
+                                    "{path}:L{lno}: new function `{fname}()` is macro-aliased in sibling header ({alias_info})"
+                                ));
+                            }
+                        }
                         let key = (fname.to_string(), bstack.clone());
                         if let Some(&prev) = seen_fns.get(&key) {
                             if added.contains(&lno) || added.contains(&prev) {
@@ -552,6 +883,22 @@ fn run_dup_scan(
                         } else {
                             seen_fns.insert(key, lno);
                         }
+                    }
+                }
+            }
+
+            // 2d. Fallthrough duplicate error-cleanup labels (catches double device_del/kfree/unlock)
+            hit.dup_labels = scan_dup_fallthrough_labels(path, &lines, added);
+
+            // 2e. Duplicate top-level local variable declarations in function body (`int i; ... int i;`)
+            hit.dup_locals = scan_dup_local_decls(path, &lines, added);
+
+            // 2f. Collect newly added col-0 `struct foo {` in .c for batched include/ redefinition check
+            for (idx, raw) in lines.iter().enumerate() {
+                let lno = idx + 1;
+                if added.contains(&lno) {
+                    if let Some(sname) = parse_col0_struct_def(raw) {
+                        hit.added_structs.push((sname, path.clone(), lno));
                     }
                 }
             }
@@ -633,12 +980,60 @@ fn run_dup_scan(
     let mut macros = Vec::new();
     let mut funcs = Vec::new();
     let mut stmts = Vec::new();
+    let mut labels = Vec::new();
+    let mut locals = Vec::new();
+    let mut shadows = Vec::new();
+    let mut added_structs: Vec<(String, String, usize)> = Vec::new();
     let mut locks = Vec::new();
     for r in results {
         macros.extend(r.dup_macros);
         funcs.extend(r.dup_funcs);
         stmts.extend(r.dup_stmts);
+        labels.extend(r.dup_labels);
+        locals.extend(r.dup_locals);
+        shadows.extend(r.macro_shadows);
+        added_structs.extend(r.added_structs);
         locks.extend(r.lock_regressions);
+    }
+
+    // Batched cross-header check for `struct foo {` added in a .c file that already exists in include/
+    let mut dup_structs = Vec::new();
+    if !added_structs.is_empty() {
+        let mut names: Vec<String> = added_structs.iter().map(|(n, _, _)| n.clone()).collect();
+        names.sort();
+        names.dedup();
+        let mut hdr_map: HashMap<String, Vec<String>> = HashMap::new();
+        for chunk in names.chunks(60) {
+            let pat = format!(r"^struct\s+({})\s*\{{", chunk.join("|"));
+            let (_, out) = rg(&ctx.repo, &["-n", "-g", "*.h", &pat, "include", "arch/arm64/include"]);
+            for ln in out.lines() {
+                let p: Vec<&str> = ln.splitn(3, ':').collect();
+                if p.len() == 3 {
+                    if let Some(sname) = parse_col0_struct_def(p[2]) {
+                        hdr_map.entry(sname).or_default().push(format!("{}:{}", p[0], p[1]));
+                    }
+                }
+            }
+        }
+        for (sname, cpath, lno) in &added_structs {
+            if let Some(hlocs) = hdr_map.get(sname) {
+                if let Ok(ctxt) = fs::read_to_string(ctx.repo.join(cpath)) {
+                    for hloc in hlocs {
+                        let hfile = hloc.split(':').next().unwrap_or("");
+                        let hbase = Path::new(hfile)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if !hbase.is_empty() && ctxt.contains(&hbase) {
+                            dup_structs.push(format!(
+                                "{cpath}:L{lno}: `struct {sname} {{` already defined in included header {hloc}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     println!(
@@ -646,31 +1041,61 @@ fn run_dup_scan(
         files.len(),
         cc_files.len()
     );
-    let total = macros.len() + funcs.len() + stmts.len() + locks.len();
+    let total = macros.len()
+        + funcs.len()
+        + stmts.len()
+        + labels.len()
+        + locals.len()
+        + shadows.len()
+        + dup_structs.len()
+        + locks.len();
     if total == 0 {
-        println!("  clean: 0 duplicate macros/funcs, 0 duplicate statements, 0 lock-balance regressions");
-        return (0, "0 dup macros/funcs, 0 dup stmts, 0 lock regressions".into());
+        println!("  clean: 0 dup macros/funcs/locals/structs/labels, 0 dup stmts, 0 lock-balance regressions");
+        return (0, "0 dup macros/funcs/locals/structs/labels, 0 dup stmts, 0 lock regressions".into());
     }
     for m in &macros {
-        println!("  DUP MACRO  {m}");
+        println!("  DUP MACRO    {m}");
     }
     for f in &funcs {
-        println!("  DUP FUNC   {f}");
+        println!("  DUP FUNC     {f}");
+    }
+    for l in &labels {
+        println!("  DUP LABEL    {l}");
+    }
+    for v in &locals {
+        println!("  DUP LOCAL    {v}");
+    }
+    for s in &dup_structs {
+        println!("  DUP STRUCT   {s}");
+    }
+    for ms in &shadows {
+        println!("  MACRO SHADOW {ms}");
     }
     for s in &stmts {
-        println!("  DUP STMT   {s}");
+        println!("  DUP STMT     {s}");
     }
     for l in &locks {
-        println!("  LOCK DRIFT {l}");
+        println!("  LOCK DRIFT   {l}");
     }
+    let hard_cnt = macros.len()
+        + funcs.len()
+        + labels.len()
+        + locals.len()
+        + dup_structs.len()
+        + shadows.len()
+        + locks.len();
     let msg = format!(
-        "{} dup macros, {} dup funcs, {} dup stmts, {} lock drift",
+        "{} macro, {} func, {} label, {} local, {} struct, {} shadow, {} stmt, {} lock",
         macros.len(),
         funcs.len(),
+        labels.len(),
+        locals.len(),
+        dup_structs.len(),
+        shadows.len(),
         stmts.len(),
         locks.len()
     );
-    (if macros.is_empty() && funcs.is_empty() && locks.is_empty() { 0 } else { 1 }, msg)
+    (if hard_cnt == 0 { 0 } else { 1 }, msg)
 }
 
 // ------------------------------------ 3. struct-loss (vanished fields still used)
@@ -868,7 +1293,7 @@ pub fn cmd_verify(
         _ => format!("{base}..HEAD"),
     };
     println!("========================================================================");
-    println!("ktool verify: {header}");
+    println!("kawal verify: {header}");
     println!("========================================================================\n");
 
     let mut rows: Vec<(&'static str, &'static str, String)> = Vec::new();
@@ -895,7 +1320,7 @@ pub fn cmd_verify(
     let dup_status = if rc_dup != 0 {
         hard_fail = true;
         "FAIL"
-    } else if dup_msg.starts_with("0 dup macros/funcs, 0 dup stmts") {
+    } else if dup_msg.starts_with("0 dup macros/funcs/locals") {
         "PASS"
     } else {
         "WARN"
@@ -976,6 +1401,24 @@ pub fn cmd_verify(
     }
     println!();
 
+    // 13. ACK vs upstream semantic & KMI invariants (Per-VMA lock, rust_binder exports, KMI arity)
+    let (rc_ac, ac_msg) = merge_intel::run_semantic_clashes(ctx);
+    rows.push(("ack-clash", if rc_ac == 0 { "PASS" } else { "FAIL" }, ac_msg));
+    if rc_ac != 0 {
+        hard_fail = true;
+    }
+    println!();
+
+    // 14. Upstream header-drop guard (catches `--ours` on headers dropping needed +defs)
+    if let (Some(f), Some(t)) = (up_from, up_to) {
+        let (rc_hd, hd_msg) = merge_intel::run_header_drop(ctx, f, t, all_files);
+        rows.push(("header-drop", if rc_hd == 0 { "PASS" } else { "FAIL" }, hd_msg));
+        if rc_hd != 0 {
+            hard_fail = true;
+        }
+        println!();
+    }
+
     println!("========================================================================");
     println!("VERIFY SUMMARY: {header}");
     println!("========================================================================");
@@ -983,4 +1426,63 @@ pub fn cmd_verify(
         println!("  [{st:<4}] {name:<12} {msg}");
     }
     if hard_fail { 1 } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_dup_fallthrough_labels_catches_mhi_double_del() {
+        let lines = vec![
+            "\tif (ret)",
+            "\t\tgoto err_del_dev;",
+            "\treturn 0;",
+            "err_del_dev:",
+            "\tdevice_del(&mhi_cntrl->mhi_dev->dev);",
+            "err_release_dev:",
+            "\tdevice_del(&mhi_cntrl->mhi_dev->dev);",
+            "\tput_device(&mhi_cntrl->mhi_dev->dev);",
+            "\treturn ret;",
+        ];
+        let mut added = HashSet::new();
+        added.insert(5);
+        let hits = scan_dup_fallthrough_labels("drivers/bus/mhi/host/init.c", &lines, &added);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].contains("err_del_dev:") && hits[0].contains("err_release_dev:"));
+
+        // Safe version with return between labels must NOT trigger
+        let safe_lines = vec![
+            "err_a:",
+            "\tdevice_del(&dev);",
+            "\treturn -EINVAL;",
+            "err_b:",
+            "\tdevice_del(&dev);",
+            "\treturn -ENOMEM;",
+        ];
+        let mut added2 = HashSet::new();
+        added2.insert(2);
+        assert!(scan_dup_fallthrough_labels("safe.c", &safe_lines, &added2).is_empty());
+    }
+
+    #[test]
+    fn test_scan_dup_local_decls_catches_gdsc_dup_int_i() {
+        let lines = vec![
+            "void gdsc_unregister(struct gdsc_desc *desc)",
+            "{",
+            "\tstruct gdsc **scs = desc->scs;",
+            "\tint i;",
+            "\tsize_t num = desc->num;",
+            "\tint i;",
+            "\tfor (i = 0; i < num; i++) {",
+            "\t\tint i;",
+            "\t}",
+            "}",
+        ];
+        let mut added = HashSet::new();
+        added.insert(6);
+        let hits = scan_dup_local_decls("drivers/clk/qcom/gdsc.c", &lines, &added);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].contains("L4 & L6") && hits[0].contains("`i`"));
+    }
 }

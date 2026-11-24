@@ -219,6 +219,8 @@ pub fn cmd_explain(
     summary: bool,
 ) -> i32 {
     let mid_merge = is_mid_merge(ctx);
+    let pairs_unmerged = unmerged_with_status(ctx);
+    let has_unmerged = !pairs_unmerged.is_empty();
     let (left_ref, right_ref, status_map, target_files): (String, String, BTreeMap<String, String>, Vec<String>) =
         if let Some(c) = commit {
             let fl = if files.is_empty() {
@@ -230,18 +232,24 @@ pub fn cmd_explain(
                 files.to_vec()
             };
             (format!("{c}^1"), format!("{c}^2"), BTreeMap::new(), fl)
-        } else if mid_merge {
-            let pairs = unmerged_with_status(ctx);
-            let smap: BTreeMap<String, String> = pairs.iter().map(|(c, p)| (p.clone(), c.clone())).collect();
+        } else if mid_merge || has_unmerged {
+            let smap: BTreeMap<String, String> = pairs_unmerged.iter().map(|(c, p)| (p.clone(), c.clone())).collect();
             let fl = if files.is_empty() {
-                pairs.into_iter().map(|(_, p)| p).collect()
+                pairs_unmerged.into_iter().map(|(_, p)| p).collect()
             } else {
                 files.to_vec()
             };
-            ("HEAD".to_string(), "MERGE_HEAD".to_string(), smap, fl)
+            let right = if mid_merge {
+                "MERGE_HEAD".to_string()
+            } else {
+                crate::merge_intel::read_merge3_meta(ctx)
+                    .map(|(_, t)| t)
+                    .unwrap_or_else(|| "HEAD".to_string())
+            };
+            ("HEAD".to_string(), right, smap, fl)
         } else {
             if files.is_empty() {
-                println!("Not mid-merge. Pass -c <merge_sha> or file path(s), or use `ktool why`.");
+                println!("Not mid-merge. Pass -c <merge_sha> or file path(s), or use `kawal why`.");
                 return 1;
             }
             ("HEAD^1".to_string(), "HEAD".to_string(), BTreeMap::new(), files.to_vec())
@@ -252,7 +260,13 @@ pub fn cmd_explain(
         return 0;
     }
 
-    let mbase = git(ctx, &["merge-base", &left_ref, &right_ref]).trim().to_string();
+    let mbase = if !mid_merge && has_unmerged {
+        crate::merge_intel::read_merge3_meta(ctx)
+            .map(|(b, _)| b)
+            .unwrap_or_default()
+    } else {
+        git(ctx, &["merge-base", &left_ref, &right_ref]).trim().to_string()
+    };
 
     if summary {
         return run_explain_summary(ctx, &left_ref, &right_ref, &mbase, &status_map, &target_files);
@@ -260,7 +274,7 @@ pub fn cmd_explain(
 
     // Detailed dossier per file (parallelized across files when multiple given!)
     let reports: Vec<String> = par_map(&target_files, ctx.threads.min(8), |path| {
-        explain_one_file(ctx, path, &left_ref, &right_ref, &mbase, status_map.get(path), mid_merge && commit.is_none(), show_hunks, show_patch)
+        explain_one_file(ctx, path, &left_ref, &right_ref, &mbase, status_map.get(path), (mid_merge || has_unmerged) && commit.is_none(), show_hunks, show_patch)
     });
     for rep in reports {
         print!("{rep}");
@@ -629,11 +643,11 @@ fn explain_one_file(
 
 /// Fast 16-core 3-way duplicate / already-in-HEAD detector for all unmerged files!
 pub fn cmd_dup_check(ctx: &Ctx, files: &[String]) -> i32 {
-    if !is_mid_merge(ctx) {
-        println!("Not mid-merge.");
+    let pairs = unmerged_with_status(ctx);
+    if !is_mid_merge(ctx) && pairs.is_empty() {
+        println!("Not mid-merge (no unmerged paths in index).");
         return 1;
     }
-    let pairs = unmerged_with_status(ctx);
     let targets: Vec<(String, String)> = if files.is_empty() {
         pairs
     } else {

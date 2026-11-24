@@ -4,11 +4,14 @@
 
 ## Features
 
-- **Pre-build merge & conflict gates (`merge`, `status`, `explain`, `dup-check`, `verify`, `preflight`, `build-guard`)**: 16-core `rg` + `git` archaeology, dangling symbol checks, KABI landmine detection, per-commit replay (`BOTH!`/`SPLIT`/`ABSENT`), and real `clang` pre-flight compilation checks.
+- **Pre-build merge, triage & silent-bug gates (`merge`, `merge3`, `triage`, `explain`, `dup-check`, `header-drop`, `backport-check`, `dup-scan`, `verify`, `preflight`, `build-guard`)**:
+  - Explicit-base 3-way merges (`merge3 --dry-run`) for squashed CLO/ACK trees with automatic conflict bucketing (`ACK-KMI-GUARD`, `CLO-SOC-OWNED`, `HEADER-WATCH`, `HYBRID`, `SAFE-THEIRS`) and co-changed sibling `.h` drift warnings.
+  - 14-gate `verify` catching fallthrough double-cleanup labels (`err_a:` → `err_b:` repeating `device_del()`/`kfree()`), duplicate local declarations, macro-aliased function shadowing, cross-header struct redefinitions, dropped upstream header definitions (`header-drop`), ACK Per-VMA lock / `rust_binder.ko` export / KMI arity clashes (`ack-clash`), KABI landmines, and per-commit replay (`BOTH!`/`SPLIT`/`ABSENT`).
+  - 16-core `backport-check` (`IN-LOG`/`ALREADY`/`CLEAN`/`CLEAN-C1`/`ADAPT` with `[BUILT]`/`[ACK]`/`[CLO]` risk tags and `--apply-clean`) and real `clang` `preflight` (`--built-only`, `--link` ELF64 MODPOST symbol check).
 - **Major kernel porting (`port delta`, `port api-scan`, `port kabi-check`, `port overlay-soc`, `port bzl2config`, `port build-diag`)**: Preprocessor-aware breaking-API scanner (6.6 → 6.12 / 6.18), regression guards, and build-log root-cause triage.
 - **Devicetree & post-build image safety (`dt-check`, `img-audit`)**: Real `dtc` + `fdtoverlay` + merged-DTB hardware audit (reserved-memory overlaps, regulator bounds, bootargs), plus pure-Rust ELF64 `.ko` binary auditing (vermagic, `depends=`, `SHN_UNDEF`, `__versions` CRCs, partition load order, recovery ramdisk DRM sync, AVB footer, `.config` + LTO/Rust hygiene).
 - **Live hardware & crash forensics (`live-audit`, `health`, `runtime-audit`, `crash-log`, `log-noise`, `blob-logs`)**: Single-shot ADB kernel health check, idle CPU/IRQ/slab/vmalloc/DMA-BUF/FD leak hunting with JSON baseline diffs, and pure-Rust decoding of `/sys/fs/pstore`, `shutdown-checkpoints`, `blackbox`, and `mtdoops` partitions.
-- **ROM & upstream sync (`sync latest|fetch|status|plan|apply|merge`, `prebuilts`, `hygiene`, `push`)**: Parallel CLO/AOSP/LineageOS/Linux LTS tracking and safe GPG-signed merges.
+- **ROM & upstream sync (`sync latest|fetch|status|plan|apply|merge`, `prebuilts`, `hygiene`, `push`)**: Parallel CLO/AOSP/ACK (Gitiles `Makefile` version probe)/LineageOS/Linux LTS (automatic GitHub mirror fallback) tracking and safe GPG-signed merges.
 
 ## Installation
 
@@ -20,7 +23,12 @@ cargo install kawal
 
 ```bash
 kawal --help
-kawal verify v6.12.92 v6.12.119
+kawal merge3 ack/kp5-base ack/android16-6.12-lts --dry-run
+kawal triage
+kawal header-drop v6.12.117 v6.12.119
+kawal backport-check /path/to/linux-6.18.git <sha1> <sha2>
+kawal verify v6.12.117 v6.12.119
+kawal preflight --built-only --link
 kawal dt-check
 kawal img-audit
 kawal live-audit -s <serial>

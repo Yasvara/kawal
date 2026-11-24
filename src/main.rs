@@ -9,6 +9,7 @@ mod elf;
 mod explain;
 mod gate;
 mod lognoise;
+mod merge_intel;
 mod port;
 mod preflight;
 mod romops;
@@ -31,12 +32,18 @@ USAGE:
 
 MERGE & CONFLICT TRIAGE:
   merge     <tag>                      GPG-signed merge w/ rerere=false + auto-fix bindings symlink
+  merge3    <base> <theirs> [--dry-run] explicit-base 3-way merge (for squashed CLO/ACK trees!) + auto-triage
+  triage    [--apply-safe]             16-core conflict classifier (ACK-KMI-GUARD / CLO-SOC-OWNED /
+                                       HEADER-WATCH / HYBRID / SAFE-THEIRS) + co-header drift warning
   status                               list unmerged paths w/ [BUILT]/[unbuilt] + conflict code
   explain   [-s] [-c <sha>] [--no-hunks] [--no-patch] [files...]
                                        -s: <1s batched triage table of all conflicts (ALL-DUP/HAS-REV/MISS)
                                        default: full dossier (incoming WHY, Fixes: revert check, local
                                        divergence, 3-way :1:..:3: upstream intent, missing-symbol audit)
   dup-check [files...]                 16-core 3-way test: ALREADY-IN-HEAD vs CONTEXT-ONLY vs REAL-CONFLICT
+  backport-check <repo.git> [--apply-clean] <shas...|@file>
+                                       16-core patch status scanner (IN-LOG/ALREADY/CLEAN/CLEAN-C1/ADAPT)
+                                       with [BUILT]/[ACK]/[CLO] risk tags & optional clean auto-apply
   why       <sym|sha|file:L[-E]> [paths...] [-n N]
                                        fast git archaeology: WHY merged, reverted, dropped, or changed
   flow      <symbol> [paths...] [--no-struct]
@@ -50,15 +57,18 @@ PRE-BUILD HIDDEN-MERGE GATES:
   landmines <base> <tag>               new code vs still-active KABI header deletions
   vendorapi <base> <tag>               changed include/ prototypes vs vendor & sm8735-modules
   partial   <base> <tag> [--built-only] 16-core per-commit replay (BOTH!/SPLIT/ABSENT, skips byte-identical)
-  dup-scan  <base> [head] [--all]      detect dup #defines, dup statements & lock-balance regressions
+  dup-scan  <base> [head] [--all]      detect dup macros/funcs/locals/structs/fallthrough-labels & lock drift
+  header-drop <from> <to> [--all]      detect upstream header +defs lost via --ours but still used in HEAD
   struct-loss <base> [head] [--all]    detect vanished struct fields still referenced via ->
   verify    <from> [to] [--base <ref>] [--all]
-                                       FULL 11-gate version-to-version merge verifier (merge-chain, GPG,
+                                       FULL 14-gate version-to-version merge verifier (merge-chain, GPG,
                                        markers, dup-scan, struct-loss, dangle, landmines, vendorapi,
-                                       partial/absent, boot-risk, abi-audit, sem-audit + verdict table)
-  preflight [base] [--link] [--no-deps] [--no-guard] [files...]
+                                       partial/absent, boot-risk, abi-audit, sem-audit, build-guard,
+                                       ack-clash, header-drop + verdict table)
+  preflight [base] [--built-only] [--show-new] [--link] [--no-deps] [--no-guard] [files...]
                                        16-core REAL `clang` pre-flight check using Kbuild .o.cmd flags
                                        (+ auto new -I dirs, sibling fallback for new .c, build-guard).
+                                       --built-only: skip speculative [NEW] unbuilt sibling files.
                                        --link: compile native ELF64 .o & verify 100% of MODPOST symbols!
   build-guard [base] [head]            5-gate build/sandbox guard: RO-source writes, Bazel-vs-Kbuild
                                        drift, UAPI bare-type hygiene, Soong Android.bp dups, +x scripts
@@ -74,7 +84,7 @@ PRE-BUILD HIDDEN-MERGE GATES:
                                        POST-BUILD pre-flash gate: UTS_RELEASE, image sync, pure-Rust
                                        ELF64 .ko audit (vermagic, depends=, symbols, CRCs, boot-order,
                                        modules.load*), .config/LTO/symvers hygiene, & build log scan
-  live-audit [-s <serial>] [--full]    POST-FLASH adb kernel check (--full runs full `ktool health`)
+  live-audit [-s <serial>] [--full]    POST-FLASH adb kernel check (--full runs full `kawal health`)
   crash-log [-s <serial>] [--slots N]  decode /sys/fs/pstore, shutdown-checkpoints, blackbox & mtdoops slots
   health    [-s <serial>] [--only <secs>] [--full] [--dump-avc] [--json]
                                        single-shot full ADB device health audit (identity, kernel,
@@ -156,7 +166,7 @@ GLOBAL FLAGS & ENV:
 "#;
 
 fn main() {
-    // Restore default SIGPIPE behavior so `ktool ... | head` exits cleanly without panicking.
+    // Restore default SIGPIPE behavior so `kawal ... | head` exits cleanly without panicking.
     #[cfg(unix)]
     unsafe {
         unsafe extern "C" {
@@ -193,10 +203,65 @@ fn main() {
     let rc = match cmd {
         "merge" => {
             if args.is_empty() {
-                eprintln!("usage: ktool merge <tag>");
+                eprintln!("usage: kawal merge <tag>");
                 2
             } else {
                 gate::cmd_merge(&ctx, &args[0])
+            }
+        }
+        "merge3" => {
+            let mut dry = false;
+            let mut pos = Vec::new();
+            for a in args {
+                if a == "--dry-run" || a == "--dry" {
+                    dry = true;
+                } else {
+                    pos.push(a.as_str());
+                }
+            }
+            if pos.len() < 2 {
+                eprintln!("usage: kawal merge3 <base> <theirs> [--dry-run]");
+                2
+            } else {
+                merge_intel::cmd_merge3(&ctx, pos[0], pos[1], dry)
+            }
+        }
+        "triage" => {
+            let apply_safe = args.iter().any(|a| a == "--apply-safe");
+            merge_intel::cmd_triage(&ctx, None, None, apply_safe)
+        }
+        "header-drop" => {
+            let mut all = false;
+            let mut pos = Vec::new();
+            for a in args {
+                if a == "--all" {
+                    all = true;
+                } else {
+                    pos.push(a.as_str());
+                }
+            }
+            if pos.len() < 2 {
+                eprintln!("usage: kawal header-drop <from> <to> [--all]");
+                2
+            } else {
+                merge_intel::cmd_header_drop(&ctx, pos[0], pos[1], all)
+            }
+        }
+        "backport-check" => {
+            let mut apply_clean = false;
+            let mut pos: Vec<String> = Vec::new();
+            for a in args {
+                if a == "--apply-clean" {
+                    apply_clean = true;
+                } else {
+                    pos.push(a.clone());
+                }
+            }
+            if pos.len() < 2 {
+                eprintln!("usage: kawal backport-check <upstream.git> [--apply-clean] <shas...|@file>");
+                2
+            } else {
+                merge_intel::cmd_backport_check(&ctx, &pos[0], &pos[1..], apply_clean)
             }
         }
         "status" => gate::cmd_status(&ctx),
@@ -238,7 +303,7 @@ fn main() {
                 }
             }
             if pos.is_empty() {
-                eprintln!("usage: ktool why <sym|sha|file:L[-E]> [paths...] [-n N]");
+                eprintln!("usage: kawal why <sym|sha|file:L[-E]> [paths...] [-n N]");
                 2
             } else {
                 search::cmd_why(&ctx, &pos[0], &pos[1..], limit)
@@ -255,7 +320,7 @@ fn main() {
                 }
             }
             if pos.is_empty() {
-                eprintln!("usage: ktool flow <symbol> [paths...] [--no-struct]");
+                eprintln!("usage: kawal flow <symbol> [paths...] [--no-struct]");
                 2
             } else {
                 search::cmd_flow(&ctx, &pos[0], &pos[1..], show_struct)
@@ -263,7 +328,7 @@ fn main() {
         }
         "audit" => {
             if args.is_empty() {
-                eprintln!("usage: ktool audit <tag>");
+                eprintln!("usage: kawal audit <tag>");
                 2
             } else {
                 gate::cmd_audit(&ctx, &args[0])
@@ -285,7 +350,7 @@ fn main() {
         "reverts" => gate::cmd_reverts(&ctx, args.first().map(|s| s.as_str()).unwrap_or("")),
         "landmines" => {
             if args.len() < 2 {
-                eprintln!("usage: ktool landmines <base> <tag>");
+                eprintln!("usage: kawal landmines <base> <tag>");
                 2
             } else {
                 gate::cmd_landmines(&ctx, &args[0], &args[1])
@@ -293,7 +358,7 @@ fn main() {
         }
         "vendorapi" => {
             if args.len() < 2 {
-                eprintln!("usage: ktool vendorapi <base> <tag>");
+                eprintln!("usage: kawal vendorapi <base> <tag>");
                 2
             } else {
                 gate::cmd_vendorapi(&ctx, &args[0], &args[1])
@@ -310,7 +375,7 @@ fn main() {
                 }
             }
             if pos.len() < 2 {
-                eprintln!("usage: ktool partial <base> <tag> [--built-only]");
+                eprintln!("usage: kawal partial <base> <tag> [--built-only]");
                 2
             } else {
                 gate::cmd_partial(&ctx, pos[0], pos[1], built_only)
@@ -327,7 +392,7 @@ fn main() {
                 }
             }
             if pos.is_empty() {
-                eprintln!("usage: ktool dup-scan <base> [head] [--all]");
+                eprintln!("usage: kawal dup-scan <base> [head] [--all]");
                 2
             } else {
                 verify::cmd_dup_scan(&ctx, pos[0], pos.get(1).copied().unwrap_or("HEAD"), all)
@@ -344,7 +409,7 @@ fn main() {
                 }
             }
             if pos.is_empty() {
-                eprintln!("usage: ktool struct-loss <base> [head] [--all]");
+                eprintln!("usage: kawal struct-loss <base> [head] [--all]");
                 2
             } else {
                 verify::cmd_struct_loss(&ctx, pos[0], pos.get(1).copied().unwrap_or("HEAD"), all)
@@ -367,7 +432,7 @@ fn main() {
                 k += 1;
             }
             if pos.is_empty() {
-                eprintln!("usage: ktool verify <from> [to] [--base <ref>] [--all]");
+                eprintln!("usage: kawal verify <from> [to] [--base <ref>] [--all]");
                 2
             } else {
                 verify::cmd_verify(&ctx, pos[0], pos.get(1).copied(), base_ov, all)
@@ -377,6 +442,8 @@ fn main() {
             let mut with_deps = true;
             let mut link_check = false;
             let mut run_guard = true;
+            let mut built_only = false;
+            let mut show_new = false;
             let mut base: Option<String> = None;
             let mut files: Vec<String> = Vec::new();
             for a in args {
@@ -386,6 +453,10 @@ fn main() {
                     link_check = true;
                 } else if a == "--no-guard" {
                     run_guard = false;
+                } else if a == "--built-only" {
+                    built_only = true;
+                } else if a == "--show-new" {
+                    show_new = true;
                 } else if a.ends_with(".c") || a.ends_with(".h") {
                     files.push(a.clone());
                 } else if base.is_none() {
@@ -394,7 +465,16 @@ fn main() {
                     files.push(a.clone());
                 }
             }
-            preflight::cmd_preflight(&ctx, base.as_deref(), with_deps, link_check, run_guard, &files)
+            preflight::cmd_preflight(
+                &ctx,
+                base.as_deref(),
+                with_deps,
+                link_check,
+                run_guard,
+                built_only,
+                show_new,
+                &files,
+            )
         }
         "build-guard" => {
             let base = args.first().map(|s| s.as_str());
@@ -404,7 +484,7 @@ fn main() {
         "dt-check" => dt::cmd_dt_check(&ctx),
         "abi-audit" => {
             if args.is_empty() {
-                eprintln!("usage: ktool abi-audit <base> [head]");
+                eprintln!("usage: kawal abi-audit <base> [head]");
                 2
             } else {
                 abi::cmd_abi_audit(&ctx, &args[0], args.get(1).map(|s| s.as_str()).unwrap_or("HEAD"))
@@ -424,7 +504,7 @@ fn main() {
                 k += 1;
             }
             if pos.is_empty() {
-                eprintln!("usage: ktool sem-audit <base> [head] [--up <tag>]");
+                eprintln!("usage: kawal sem-audit <base> [head] [--up <tag>]");
                 2
             } else {
                 abi::cmd_sem_audit(&ctx, pos[0], pos.get(1).copied().unwrap_or("HEAD"), up_to)
@@ -445,7 +525,7 @@ fn main() {
                 k += 1;
             }
             if pos.is_empty() {
-                eprintln!("usage: ktool boot-risk <from> [to] [--base <ref>]");
+                eprintln!("usage: kawal boot-risk <from> [to] [--base <ref>]");
                 2
             } else {
                 boot::cmd_boot_risk(&ctx, pos[0], pos.get(1).copied(), base_ov)
@@ -550,7 +630,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("unknown health flag: {other}");
-                        eprintln!("usage: ktool health [-s <serial>] [--only id,kernel,services,crashes,avc,touch,power,sys,logs] [--full] [--dump-avc] [--json]");
+                        eprintln!("usage: kawal health [-s <serial>] [--only id,kernel,services,crashes,avc,touch,power,sys,logs] [--full] [--dump-avc] [--json]");
                         return;
                     }
                 }
@@ -602,7 +682,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("unknown runtime-audit flag: {other}");
-                        eprintln!("usage: ktool runtime-audit [-s <serial>] [--window N] [--only cpu,irq,power,mem,fd,dmabuf,daemons,alarms,avc] [--top N] [--full] [--save <file>] [--diff <file>] [--json]");
+                        eprintln!("usage: kawal runtime-audit [-s <serial>] [--window N] [--only cpu,irq,power,mem,fd,dmabuf,daemons,alarms,avc] [--top N] [--full] [--save <file>] [--diff <file>] [--json]");
                         return;
                     }
                 }
@@ -655,7 +735,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("unknown log-noise flag: {other}");
-                        eprintln!("usage: ktool log-noise [-s <serial>] [--lines N] [--min N] [--level V,D,I,W,E] [--all] [--no-blobs] [--json]");
+                        eprintln!("usage: kawal log-noise [-s <serial>] [--lines N] [--min N] [--level V,D,I,W,E] [--all] [--no-blobs] [--json]");
                         return;
                     }
                 }
@@ -700,7 +780,7 @@ fn main() {
                     }
                     other => {
                         eprintln!("unknown blob-logs flag: {other}");
-                        eprintln!("usage: ktool blob-logs <target...> [-f <pat>] [-l V,D,I,W,E] [--emit-fixup] [--limit N] [--json]");
+                        eprintln!("usage: kawal blob-logs <target...> [-f <pat>] [-l V,D,I,W,E] [--emit-fixup] [--limit N] [--json]");
                         return;
                     }
                 }
@@ -718,7 +798,7 @@ fn main() {
                 }
             }
             if pos.len() < 2 {
-                eprintln!("usage: ktool check <base> <tag> [--all]");
+                eprintln!("usage: kawal check <base> <tag> [--all]");
                 2
             } else {
                 gate::cmd_check(&ctx, pos[0], pos[1], all)
@@ -726,7 +806,7 @@ fn main() {
         }
         "config" => {
             if args.is_empty() {
-                eprintln!("usage: ktool config <baseline> [current]");
+                eprintln!("usage: kawal config <baseline> [current]");
                 2
             } else {
                 let base = PathBuf::from(&args[0]);
@@ -739,7 +819,7 @@ fn main() {
         }
         "clo" => {
             if args.is_empty() {
-                eprintln!("usage: ktool clo <diff|probe|merge> ...");
+                eprintln!("usage: kawal clo <diff|probe|merge> ...");
                 2
             } else {
                 match args[0].as_str() {
@@ -761,7 +841,7 @@ fn main() {
                             }
                         }
                         if pos.len() < 2 {
-                            eprintln!("usage: ktool clo diff <old.xml> <new.xml> [--filter <pat>] [--check-local <src>]");
+                            eprintln!("usage: kawal clo diff <old.xml> <new.xml> [--filter <pat>] [--check-local <src>]");
                             2
                         } else {
                             clo::cmd_clo_diff(
@@ -786,7 +866,7 @@ fn main() {
                             }
                         }
                         if pos.len() < 3 {
-                            eprintln!("usage: ktool -R <repo> clo probe <subpath> <cache.git> <target_rev> [--filter <pat>]");
+                            eprintln!("usage: kawal -R <repo> clo probe <subpath> <cache.git> <target_rev> [--filter <pat>]");
                             2
                         } else {
                             clo::cmd_clo_probe(&ctx, pos[0], PathBuf::from(pos[1]).as_path(), pos[2], flt)
@@ -803,7 +883,7 @@ fn main() {
                             }
                         }
                         if pos.len() < 4 {
-                            eprintln!("usage: ktool -R <repo> clo merge <subpath> <cache.git> <base> <target> [--dry-run]");
+                            eprintln!("usage: kawal -R <repo> clo merge <subpath> <cache.git> <base> <target> [--dry-run]");
                             2
                         } else {
                             clo::cmd_clo_merge(&ctx, pos[0], PathBuf::from(pos[1]).as_path(), pos[2], pos[3], dry)
@@ -818,7 +898,7 @@ fn main() {
         }
         "clo-delta" => {
             if args.is_empty() {
-                eprintln!("usage: ktool clo-delta <clo_ref> [stable_ref]");
+                eprintln!("usage: kawal clo-delta <clo_ref> [stable_ref]");
                 2
             } else {
                 gate::cmd_clo_delta(&ctx, &args[0], args.get(1).map(|s| s.as_str()))
@@ -826,7 +906,7 @@ fn main() {
         }
         "sync" => {
             if args.is_empty() {
-                eprintln!("usage: ktool sync <latest|fetch|status|plan|apply> ...");
+                eprintln!("usage: kawal sync <latest|fetch|status|plan|apply> ...");
                 2
             } else {
                 match args[0].as_str() {
@@ -879,7 +959,7 @@ fn main() {
                             }
                         }
                         if pos.is_empty() {
-                            eprintln!("usage: ktool sync fetch <tag> [--out <file>] [--with-techpacks]");
+                            eprintln!("usage: kawal sync fetch <tag> [--out <file>] [--with-techpacks]");
                             2
                         } else {
                             sync::cmd_sync_fetch(&ctx, pos[0], out_p.as_deref(), with_tp)
@@ -941,7 +1021,7 @@ fn main() {
                             }
                         }
                         if pos.is_empty() {
-                            eprintln!("usage: ktool sync plan <new.xml> [--old <old.xml>] [--filter <pat>] [--commits]");
+                            eprintln!("usage: kawal sync plan <new.xml> [--old <old.xml>] [--filter <pat>] [--commits]");
                             2
                         } else {
                             sync::cmd_sync_plan(
@@ -995,7 +1075,7 @@ fn main() {
                             }
                         }
                         if pos.is_empty() {
-                            eprintln!("usage: ktool sync apply <new.xml> [--old <old.xml>] [--dry-run] [-j N] [--filter <pat>]");
+                            eprintln!("usage: kawal sync apply <new.xml> [--old <old.xml>] [--dry-run] [-j N] [--filter <pat>]");
                             2
                         } else {
                             sync::cmd_sync_apply(
@@ -1047,7 +1127,7 @@ fn main() {
                             }
                         }
                         if pos.is_empty() {
-                            eprintln!("usage: ktool sync merge <new.xml> [--old <old.xml>] [--dry-run] [-j N] [--filter <pat>] [--update-manifest]");
+                            eprintln!("usage: kawal sync merge <new.xml> [--old <old.xml>] [--dry-run] [-j N] [--filter <pat>] [--update-manifest]");
                             2
                         } else {
                             romops::cmd_sync_merge(
@@ -1160,7 +1240,7 @@ fn main() {
         }
         "port" => {
             if args.is_empty() {
-                eprintln!("usage: ktool port <delta|api-scan|kabi-check|config-check|dt-compat> [args...]");
+                eprintln!("usage: kawal port <delta|api-scan|kabi-check|config-check|dt-compat> [args...]");
                 2
             } else {
                 match args[0].as_str() {
@@ -1246,7 +1326,7 @@ fn main() {
                     }
                     "config-check" => {
                         if args.len() < 2 {
-                            eprintln!("usage: ktool port config-check <fragment> [target_kernel_dir]");
+                            eprintln!("usage: kawal port config-check <fragment> [target_kernel_dir]");
                             2
                         } else {
                             let frag = PathBuf::from(&args[1]);
@@ -1286,7 +1366,7 @@ fn main() {
                             }
                         }
                         if pos.len() < 2 {
-                            eprintln!("usage: ktool port overlay-soc <soc.git> <ref> [--common <common.git> <ref>] [--apply]");
+                            eprintln!("usage: kawal port overlay-soc <soc.git> <ref> [--common <common.git> <ref>] [--apply]");
                             2
                         } else {
                             let copt = common_git
@@ -1318,7 +1398,7 @@ fn main() {
                             }
                         }
                         if pos.len() < 3 {
-                            eprintln!("usage: ktool port bzl2config <soc.git> <ref> <path.bzl> [--out <file>]");
+                            eprintln!("usage: kawal port bzl2config <soc.git> <ref> <path.bzl> [--out <file>]");
                             2
                         } else {
                             port::cmd_port_bzl2config(
@@ -1352,7 +1432,7 @@ fn main() {
                             }
                         }
                         if pos.len() < 2 {
-                            eprintln!("usage: ktool port header-diff <soc.git> <ref> [--common <common.git> <ref>]");
+                            eprintln!("usage: kawal port header-diff <soc.git> <ref> [--common <common.git> <ref>]");
                             2
                         } else {
                             let copt = common_git
@@ -1383,7 +1463,7 @@ fn main() {
                             }
                         }
                         if pos.is_empty() {
-                            eprintln!("usage: ktool port build-diag <build.log> [--top N]");
+                            eprintln!("usage: kawal port build-diag <build.log> [--top N]");
                             2
                         } else {
                             port::cmd_port_build_diag(PathBuf::from(pos[0]).as_path(), top)
@@ -1401,7 +1481,7 @@ fn main() {
             0
         }
         other => {
-            eprintln!("unknown command: {other}\nRun `ktool --help` for usage.");
+            eprintln!("unknown command: {other}\nRun `kawal --help` for usage.");
             2
         }
     };

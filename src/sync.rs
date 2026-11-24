@@ -14,6 +14,7 @@ const CLO_QSSI_REPO: &str = "https://git.codelinaro.org/clo/la/la/system/manifes
 const CLO_VENDOR_REPO: &str = "https://git.codelinaro.org/clo/la/la/vendor/manifest.git";
 const CLO_KP_REPO: &str = "https://git.codelinaro.org/clo/la/kernelplatform/manifest.git";
 const LINUX_STABLE_REPO: &str = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git";
+const LINUX_STABLE_FALLBACK_REPO: &str = "https://github.com/gregkh/linux.git";
 const AOSP_ACK_REPO: &str = "https://android.googlesource.com/kernel/common";
 pub(crate) const AOSP_MANIFEST_REPO: &str = "https://android.googlesource.com/platform/manifest";
 const LINEAGE_MANIFEST_REPO: &str = "https://github.com/LineageOS/android.git";
@@ -147,6 +148,65 @@ fn ls_remote_head(cwd: &Path, url: &str, branch: &str) -> Result<String, String>
         .and_then(|ln| ln.split_whitespace().next())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("branch {branch} not found"))
+}
+
+/// Pure-Rust base64 decoder for tiny Gitiles `?format=TEXT` responses (e.g. `Makefile`).
+pub(crate) fn decode_base64(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => continue,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub(crate) fn parse_makefile_kver(txt: &str) -> Option<String> {
+    let (mut ver, mut patch, mut sub) = (String::new(), String::new(), String::new());
+    for ln in txt.lines().take(15) {
+        let t = ln.trim();
+        if let Some(v) = t.strip_prefix("VERSION =") {
+            ver = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("PATCHLEVEL =") {
+            patch = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("SUBLEVEL =") {
+            sub = v.trim().to_string();
+        }
+    }
+    if ver.is_empty() || patch.is_empty() || sub.is_empty() {
+        None
+    } else {
+        Some(format!("v{ver}.{patch}.{sub}"))
+    }
+}
+
+fn fetch_gitiles_kernel_version(cwd: &Path, repo_url: &str, branch: &str) -> Option<String> {
+    let url = format!("{}/+/refs/heads/{branch}/Makefile?format=TEXT", repo_url.trim_end_matches('/'));
+    let (rc, body, _) = run_cmd(
+        "curl",
+        &["-fsSL", "--connect-timeout", "8", "--max-time", "15", &url],
+        cwd,
+        None,
+    );
+    if rc != 0 || body.is_empty() {
+        return None;
+    }
+    let decoded = decode_base64(&body);
+    parse_makefile_kver(&decoded)
 }
 
 // ====================================================== 2. Full Recursive Yasvara Manifest Expander
@@ -384,20 +444,21 @@ fn detect_local_vendor_xml(ws_root: &Path) -> (String, Option<PathBuf>) {
     ("unknown".to_string(), None)
 }
 
-fn detect_local_kp_tag(ws_root: &Path) -> String {
+fn detect_local_kp_tag_prefix(ws_root: &Path, prefix: &str) -> String {
     let dir = ws_root.join("lab/clo-manifests");
     let mut best: Option<String> = None;
     if let Ok(rd) = fs::read_dir(&dir) {
         for ent in rd.flatten() {
             let fname = ent.file_name().to_string_lossy().into_owned();
-            if let Some(rest) = fname.strip_prefix("kp-").and_then(|s| s.strip_suffix(".xml")) {
-                let tag = format!("KERNEL.PLATFORM.4.0.r1-{rest}-kernel.0");
-                if best.as_ref().map_or(true, |b| nat_key(&tag) > nat_key(b)) {
-                    best = Some(tag);
-                }
+            let cand = if let Some(rest) = fname.strip_prefix("kp-").and_then(|s| s.strip_suffix(".xml")) {
+                Some(format!("KERNEL.PLATFORM.4.0.r1-{rest}-kernel.0"))
             } else if fname.starts_with("KERNEL.PLATFORM.") && fname.ends_with(".xml") {
-                let tag = fname.trim_end_matches(".xml").to_string();
-                if best.as_ref().map_or(true, |b| nat_key(&tag) > nat_key(b)) {
+                Some(fname.trim_end_matches(".xml").to_string())
+            } else {
+                None
+            };
+            if let Some(tag) = cand {
+                if tag.starts_with(prefix) && best.as_ref().map_or(true, |b| nat_key(&tag) > nat_key(b)) {
                     best = Some(tag);
                 }
             }
@@ -454,7 +515,7 @@ fn detect_local_lineage_head(ws_root: &Path) -> (String, String) {
     (sha, subj)
 }
 
-// ====================================================== 4. `ktool sync fetch <tag>`
+// ====================================================== 4. `kawal sync fetch <tag>`
 
 /// Map any CLO tag to `(manifest_repo_path, xml_filename)` under `https://git.codelinaro.org/clo/la`.
 pub fn clo_tag_to_repo_and_file(tag: &str) -> Option<(String, String)> {
@@ -564,7 +625,7 @@ pub fn cmd_sync_fetch(ctx: &Ctx, tag: &str, out_opt: Option<&Path>, with_techpac
                 }
             }
             if tag.starts_with("LA.QSSI.") {
-                println!("\nNext: ktool sync plan {}", dest.display());
+                println!("\nNext: kawal sync plan {}", dest.display());
             }
             0
         }
@@ -575,23 +636,28 @@ pub fn cmd_sync_fetch(ctx: &Ctx, tag: &str, out_opt: Option<&Path>, with_techpac
     }
 }
 
-// ====================================================== 5. `ktool sync latest`
+// ====================================================== 5. `kawal sync latest`
 
 struct TrackSpec {
     label: String,
     local: String,
     url: String,
+    fallback_url: Option<String>,
     patterns: Vec<String>,
     /// Optional repo project path under CLO_BASE for `--fetch-xml`.
     fetch_project: Option<String>,
     /// True if querying branch HEAD instead of tags.
     is_branch: bool,
+    /// True if branch HEAD should also resolve `vX.Y.Z` from Gitiles `Makefile`.
+    gitiles_kver: bool,
 }
 
 struct TrackResult {
     label: String,
     local: String,
     is_branch: bool,
+    resolved_ver: Option<String>,
+    used_mirror: bool,
     latest: Result<(String, Vec<String>), String>, // (latest_tag_or_sha, newer_tags_list)
     fetch_project: Option<String>,
 }
@@ -600,16 +666,35 @@ fn check_track(cwd: &Path, spec: &TrackSpec) -> TrackResult {
     if spec.is_branch {
         let br = spec.patterns.first().map(|s| s.as_str()).unwrap_or("main");
         let latest = ls_remote_head(cwd, &spec.url, br).map(|sha| (sha, Vec::new()));
+        let resolved_ver = if spec.gitiles_kver && latest.is_ok() {
+            fetch_gitiles_kernel_version(cwd, &spec.url, br)
+        } else {
+            None
+        };
         return TrackResult {
             label: spec.label.clone(),
             local: spec.local.clone(),
             is_branch: true,
+            resolved_ver,
+            used_mirror: false,
             latest,
             fetch_project: None,
         };
     }
     let pats: Vec<&str> = spec.patterns.iter().map(|s| s.as_str()).collect();
-    let res = ls_remote_tags(cwd, &spec.url, &pats).map(|tags| {
+    let mut used_mirror = false;
+    let raw_tags = match ls_remote_tags(cwd, &spec.url, &pats) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            if let Some(ref fb) = spec.fallback_url {
+                used_mirror = true;
+                ls_remote_tags(cwd, fb, &pats).map_err(|fe| format!("{e}; mirror: {fe}"))
+            } else {
+                Err(e)
+            }
+        }
+    };
+    let res = raw_tags.map(|tags| {
         // Filter out non-release tags like `-rc` for linux stable
         let clean: Vec<String> = tags
             .into_iter()
@@ -632,6 +717,8 @@ fn check_track(cwd: &Path, spec: &TrackSpec) -> TrackResult {
         label: spec.label.clone(),
         local: spec.local.clone(),
         is_branch: false,
+        resolved_ver: None,
+        used_mirror,
         latest: res,
         fetch_project: spec.fetch_project.clone(),
     }
@@ -673,9 +760,11 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
             label: "Framework (CLO QSSI 17.0)".to_string(),
             local: loc,
             url: CLO_QSSI_REPO.to_string(),
+            fallback_url: None,
             patterns: vec!["LA.QSSI.17.0.r1-*".to_string()],
             fetch_project: Some("la/system/manifest".to_string()),
             is_branch: false,
+            gitiles_kver: false,
         });
     }
     if opts.vendor {
@@ -683,52 +772,74 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
             label: "Vendor (CLO Pakala 15.4)".to_string(),
             local: local_vendor_tag.clone(),
             url: CLO_VENDOR_REPO.to_string(),
+            fallback_url: None,
             patterns: vec!["LA.VENDOR.15.4.0.r1-*pakala*".to_string()],
             fetch_project: Some("la/vendor/manifest".to_string()),
             is_branch: false,
+            gitiles_kver: false,
         });
     }
     if opts.kernel {
         let local_kver = detect_local_kernel_version(ctx);
         specs.push(TrackSpec {
             label: "Kernel (CLO KP 4.0 / 6.6)".to_string(),
-            local: detect_local_kp_tag(&ctx.ws_root),
+            local: detect_local_kp_tag_prefix(&ctx.ws_root, "KERNEL.PLATFORM.4.0."),
             url: CLO_KP_REPO.to_string(),
+            fallback_url: None,
             patterns: vec!["KERNEL.PLATFORM.4.0.r1-*".to_string()],
             fetch_project: Some("kernelplatform/manifest".to_string()),
             is_branch: false,
+            gitiles_kver: false,
         });
         specs.push(TrackSpec {
             label: "Kernel (CLO KP 5.0 / 6.12)".to_string(),
-            local: detect_local_kp_tag(&ctx.ws_root),
+            local: detect_local_kp_tag_prefix(&ctx.ws_root, "KERNEL.PLATFORM.5.0."),
             url: CLO_KP_REPO.to_string(),
+            fallback_url: None,
             patterns: vec!["KERNEL.PLATFORM.5.0.r1-*".to_string()],
             fetch_project: Some("kernelplatform/manifest".to_string()),
             is_branch: false,
+            gitiles_kver: false,
         });
         specs.push(TrackSpec {
             label: "Kernel (Linux 6.6 LTS)".to_string(),
             local: local_kver.clone(),
             url: LINUX_STABLE_REPO.to_string(),
+            fallback_url: Some(LINUX_STABLE_FALLBACK_REPO.to_string()),
             patterns: vec!["v6.6.*".to_string()],
             fetch_project: None,
             is_branch: false,
+            gitiles_kver: false,
         });
         specs.push(TrackSpec {
             label: "Kernel (Linux 6.12 LTS)".to_string(),
             local: local_kver.clone(),
             url: LINUX_STABLE_REPO.to_string(),
+            fallback_url: Some(LINUX_STABLE_FALLBACK_REPO.to_string()),
             patterns: vec!["v6.12.*".to_string()],
             fetch_project: None,
             is_branch: false,
+            gitiles_kver: false,
         });
         specs.push(TrackSpec {
-            label: "Kernel (ACK android16-6.12)".to_string(),
+            label: "Kernel (ACK 16-6.12-lts)".to_string(),
+            local: local_kver.clone(),
+            url: AOSP_ACK_REPO.to_string(),
+            fallback_url: None,
+            patterns: vec!["android16-6.12-lts".to_string()],
+            fetch_project: None,
+            is_branch: true,
+            gitiles_kver: true,
+        });
+        specs.push(TrackSpec {
+            label: "Kernel (ACK 16-6.12)".to_string(),
             local: local_kver,
             url: AOSP_ACK_REPO.to_string(),
+            fallback_url: None,
             patterns: vec!["android16-6.12".to_string()],
             fetch_project: None,
             is_branch: true,
+            gitiles_kver: true,
         });
     }
     if opts.aosp {
@@ -737,12 +848,14 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
             label: "AOSP 17 (Main+Security)".to_string(),
             local: loc,
             url: AOSP_MANIFEST_REPO.to_string(),
+            fallback_url: None,
             patterns: vec![
                 "android-17.0.0_r*".to_string(),
                 "android-security-17.0.0_r*".to_string(),
             ],
             fetch_project: None,
             is_branch: false,
+            gitiles_kver: false,
         });
     }
     if opts.lineage {
@@ -751,9 +864,11 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
             label: "LineageOS 24.0 manifest".to_string(),
             local: truncate_str(&sha, 12).to_string(),
             url: LINEAGE_MANIFEST_REPO.to_string(),
+            fallback_url: None,
             patterns: vec!["lineage-24.0".to_string()],
             fetch_project: None,
             is_branch: true,
+            gitiles_kver: false,
         });
     }
     if opts.techpacks {
@@ -762,15 +877,17 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
                 let m = clo::parse_manifest_xml(&txt);
                 for r in m.refs.values() {
                     if r.project.starts_with("techpack/") {
-                        // Prefix before the trailing build counter, e.g. `AU_TECHPACK_DISPLAY.LA.5.0.R1.*`
-                        let pat = format!("AU_TECHPACK_{}*", r.name);
+                        // Trailing `.` prevents `R1*` from false-matching `R10`/`R11`/`R12` OEM branches!
+                        let pat = format!("AU_TECHPACK_{}.*", r.name);
                         specs.push(TrackSpec {
                             label: format!("TP {}", r.name),
                             local: r.tag.clone(),
                             url: format!("{CLO_BASE}/{}.git", r.project),
+                            fallback_url: None,
                             patterns: vec![pat],
                             fetch_project: Some(r.project.clone()),
                             is_branch: false,
+                            gitiles_kver: false,
                         });
                     }
                 }
@@ -781,7 +898,7 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
     }
 
     println!("==========================================================================================");
-    println!("ktool sync latest: upstream release radar (rate-limited 2 workers w/ 429 backoff)");
+    println!("kawal sync latest: upstream release radar (rate-limited 2 workers w/ 429 backoff)");
     println!("==========================================================================================");
 
     // Keep concurrency <= 2 to avoid git.codelinaro.org HTTP 429 rate limits!
@@ -794,21 +911,35 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
     for r in &results {
         match &r.latest {
             Ok((latest, newer)) => {
-                let latest_disp = if latest.len() == 40 && latest.chars().all(|c| c.is_ascii_hexdigit()) {
+                let short_or_tag = if latest.len() == 40 && latest.chars().all(|c| c.is_ascii_hexdigit()) {
                     truncate_str(latest, 12).to_string()
                 } else {
                     latest.clone()
                 };
+                let latest_disp = if let Some(ref kv) = r.resolved_ver {
+                    format!("{kv} ({short_or_tag})")
+                } else if r.used_mirror {
+                    format!("{short_or_tag} [mirror]")
+                } else {
+                    short_or_tag.clone()
+                };
                 let status = if r.local == "unknown" {
                     "INFO  ".to_string()
+                } else if let Some(ref kv) = r.resolved_ver {
+                    if nat_key(kv) <= nat_key(&r.local) {
+                        "UP2DAT".to_string()
+                    } else {
+                        updates_avail += 1;
+                        "UPDATE".to_string()
+                    }
                 } else if r.is_branch {
-                    if latest_disp == r.local {
+                    if short_or_tag == r.local {
                         "UP2DAT".to_string()
                     } else {
                         updates_avail += 1;
                         "MOVED ".to_string()
                     }
-                } else if latest_disp == r.local || (newer.is_empty() && nat_key(&latest_disp) <= nat_key(&r.local)) {
+                } else if short_or_tag == r.local || (newer.is_empty() && nat_key(&short_or_tag) <= nat_key(&r.local)) {
                     "UP2DAT".to_string()
                 } else {
                     updates_avail += 1;
@@ -849,7 +980,7 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
         errors
     );
     if !opts.techpacks {
-        println!("Tip: run `ktool sync latest --techpacks` for all Pakala techpacks, or add `--fetch-xml` to download latest XMLs.");
+        println!("Tip: run `kawal sync latest --techpacks` for all Pakala techpacks, or add `--fetch-xml` to download latest XMLs.");
     }
 
     if opts.fetch_xml && !to_fetch.is_empty() {
@@ -865,7 +996,7 @@ pub fn cmd_sync_latest(ctx: &Ctx, mut opts: LatestOpts) -> i32 {
     if errors > 0 { 1 } else { 0 }
 }
 
-// ====================================================== 6. `ktool sync status` (16-Core ROM Dashboard)
+// ====================================================== 6. `kawal sync status` (16-Core ROM Dashboard)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RepoBucket {
@@ -1017,7 +1148,7 @@ pub fn cmd_sync_status(
 
     let qssi = detect_local_qssi_tag(&ctx.ws_root);
     println!("==========================================================================================");
-    println!("ktool sync status: Yasvara ROM workspace ({} repos scanned, QSSI={qssi})", rows.len());
+    println!("kawal sync status: Yasvara ROM workspace ({} repos scanned, QSSI={qssi})", rows.len());
     println!("==========================================================================================");
     println!(
         "  PORTED(yasvara-17.0): {:<4} | YAS-24(legacy): {:<4} | CLO-CLEAN: {:<4} | CLO-DRIFT: {:<4}",
@@ -1087,7 +1218,7 @@ pub fn cmd_sync_status(
     0
 }
 
-// ====================================================== 7. `ktool sync plan` & `ktool sync apply`
+// ====================================================== 7. `kawal sync plan` & `kawal sync apply`
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanKind {
@@ -1304,7 +1435,7 @@ pub fn cmd_sync_plan(
     let missing: Vec<&PlanEntry> = entries.iter().filter(|e| e.kind == PlanKind::MissingClone).collect();
 
     println!("==========================================================================================");
-    println!("ktool sync plan: {} -> {}", old_xml.display(), new_xml.display());
+    println!("kawal sync plan: {} -> {}", old_xml.display(), new_xml.display());
     println!("==========================================================================================");
     println!(
         "  unchanged: {} | MANUAL-MERGE: {} | AUTO-FF: {} | SHADOWED-LINEAGE: {} | PREBUILT: {} | TRIMMED: {} | MISSING: {} | +{} ADD / -{} DEL",
@@ -1394,7 +1525,7 @@ pub fn cmd_sync_plan(
     }
 
     if !auto_ff.is_empty() {
-        println!("\n[3] AUTO-FF CLEAN CLO ({} repos safe for `ktool sync apply`):", auto_ff.len());
+        println!("\n[3] AUTO-FF CLEAN CLO ({} repos safe for `kawal sync apply`):", auto_ff.len());
         for e in auto_ff.iter().take(40) {
             println!(
                 "  [FF   ] {:<44} {} -> {} ({})",
@@ -1426,9 +1557,9 @@ pub fn cmd_sync_plan(
     }
 
     println!("\nNext steps:");
-    println!("  1. Preview auto fast-forward : ktool sync apply {} --dry-run", new_xml.display());
-    println!("  2. Apply clean CLO bumps     : ktool sync apply {} -j 4", new_xml.display());
-    println!("  3. Merge each MANUAL-MERGE repo with `ktool -R src/<path> merge <rev>` + `ktool explain -s`");
+    println!("  1. Preview auto fast-forward : kawal sync apply {} --dry-run", new_xml.display());
+    println!("  2. Apply clean CLO bumps     : kawal sync apply {} -j 4", new_xml.display());
+    println!("  3. Merge each MANUAL-MERGE repo with `kawal -R src/<path> merge <rev>` + `kawal explain -s`");
     0
 }
 
@@ -1556,7 +1687,7 @@ pub fn cmd_sync_apply(
     if failed.is_empty() { 0 } else { 1 }
 }
 
-// ====================================================== 8. `ktool decouple` (LineageOS Decoupling Audit)
+// ====================================================== 8. `kawal decouple` (LineageOS Decoupling Audit)
 
 const UNUSED_SOC_TOKENS: &[&str] = &[
     "msm8953", "sdm660", "sm7250", "sm8150", "sm8250", "sm8350",
@@ -1643,7 +1774,7 @@ pub fn cmd_decouple(ctx: &Ctx, filter: Option<&str>, scan_refs: bool, check_delt
 
     let total_los = unused_soc.len() + clo_overrides.len() + lineage_apps.len() + core_infra.len();
     println!("==========================================================================================");
-    println!("ktool decouple: LineageOS dependency audit (manifest/snippets/lineage.xml + yasvara.xml)");
+    println!("kawal decouple: LineageOS dependency audit (manifest/snippets/lineage.xml + yasvara.xml)");
     println!("==========================================================================================");
     println!(
         "  Total Lineage remote repos: {} | Yasvara forks still on lineage-24.0: {}",
@@ -1814,6 +1945,14 @@ mod tests {
         assert!(nat_key("LA.QSSI.17.0.r1-10300-qssi.0") > nat_key("LA.QSSI.17.0.r1-9700-qssi.0"));
         assert!(nat_key("android-security-17.0.0_r3") > nat_key("android-security-17.0.0_r2"));
         assert!(nat_key("AU_TECHPACK_DISPLAY.LA.5.0.R1.00.00.00.000.100") > nat_key("AU_TECHPACK_DISPLAY.LA.5.0.R1.00.00.00.000.087"));
+    }
+
+    #[test]
+    fn test_base64_and_makefile_kver() {
+        // "VERSION = 6\nPATCHLEVEL = 12\nSUBLEVEL = 117\n"
+        let b64 = "VkVSU0lPTiA9IDYKUEFUQ0hMRVZFTCA9IDEyClNVQkxFVkVMID0gMTE3Cg==";
+        let dec = decode_base64(b64);
+        assert_eq!(parse_makefile_kver(&dec), Some("v6.12.117".to_string()));
     }
 
     #[test]

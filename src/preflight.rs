@@ -210,9 +210,44 @@ fn find_ocmd_for_module_c(ctx: &Ctx, rel_c: &str) -> Option<(PathBuf, PathBuf)> 
     }
 }
 
+/// Skip obviously unbuilt test/kunit/foreign-vendor paths when falling back to sibling .o.cmd.
+pub fn is_noisy_unbuilt_sibling_path(rel_c: &str) -> bool {
+    if rel_c.ends_with("-test.c")
+        || rel_c.ends_with("_test.c")
+        || rel_c.ends_with("_kunit.c")
+        || rel_c.contains("/tests/")
+        || rel_c.contains("/kunit/")
+    {
+        return true;
+    }
+    for pfx in [
+        "sound/soc/amd/",
+        "sound/soc/intel/",
+        "sound/soc/sof/",
+        "sound/soc/soc-ac97.c",
+        "sound/pci/",
+        "drivers/gpu/drm/amd/",
+        "drivers/gpu/drm/i915/",
+        "drivers/gpu/drm/nouveau/",
+        "drivers/gpu/drm/xe/",
+        "drivers/net/ethernet/",
+        "drivers/infiniband/",
+        "security/selinux/netlabel.c",
+        "drivers/acpi/",
+    ] {
+        if rel_c.starts_with(pfx) {
+            return true;
+        }
+    }
+    false
+}
+
 /// For a newly-added `.c` file with no `.o.cmd` yet, check if its `<stem>.o` is referenced in
 /// its techpack's Kbuild/Makefile and if so borrow a sibling `.o.cmd` from the same or parent dir.
 fn find_sibling_ocmd(ctx: &Ctx, rel_c: &str, kbuild_cache: &mut HashMap<String, String>) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    if is_noisy_unbuilt_sibling_path(rel_c) {
+        return None;
+    }
     let p = Path::new(rel_c);
     let stem = p.file_stem()?.to_string_lossy();
     let obj_name = format!("{stem}.o");
@@ -326,6 +361,8 @@ pub fn cmd_preflight(
     with_deps: bool,
     link_check: bool,
     run_guard: bool,
+    built_only: bool,
+    show_new: bool,
     explicit_files: &[String],
 ) -> i32 {
     if !ctx.kernel_obj.is_dir() {
@@ -345,7 +382,7 @@ pub fn cmd_preflight(
 
     let clang = detect_clang_bin(ctx);
     println!(
-        "=== ktool preflight (16-core real clang {}) ===",
+        "=== kawal preflight (16-core real clang {}) ===",
         if link_check { "-c -fno-lto + ELF64 MODPOST link-check" } else { "-fsyntax-only" }
     );
     println!("  clang: {clang}");
@@ -354,6 +391,7 @@ pub fn cmd_preflight(
     let mut mod_headers: Vec<String> = Vec::new();
     let mut added_hdr_dirs_by_tp: HashMap<String, BTreeSet<PathBuf>> = HashMap::new();
 
+    let mut kconfig_or_caps_changed = false;
     if !explicit_files.is_empty() {
         for f in explicit_files {
             if f.ends_with(".c") {
@@ -370,6 +408,8 @@ pub fn cmd_preflight(
                 target_c.insert(f.to_string());
             } else if f.ends_with(".h") {
                 mod_headers.push(f.to_string());
+            } else if f.ends_with("Kconfig") || f == "arch/arm64/tools/cpucaps" {
+                kconfig_or_caps_changed = true;
             }
         }
         let dirty = git(ctx, &["diff", "--name-only"]);
@@ -420,6 +460,10 @@ pub fn cmd_preflight(
     let mut kbuild_cache: HashMap<String, String> = HashMap::new();
 
     for f in &target_c {
+        if !ctx.repo.join(f).is_file() {
+            skipped_unbuilt += 1;
+            continue;
+        }
         let tp = buildguard::techpack_root(f);
         let extra_incs: Vec<PathBuf> = added_hdr_dirs_by_tp
             .get(&tp)
@@ -442,16 +486,20 @@ pub fn cmd_preflight(
                     extra_incs,
                 });
             }
-        } else if let Some((sib_ocmd, cwd, abs_src)) = find_sibling_ocmd(ctx, f, &mut kbuild_cache) {
-            jobs.push(PreflightJob {
-                label: format!("[NEW] {f}"),
-                techpack: tp,
-                ocmd: sib_ocmd,
-                cwd,
-                override_src: Some(abs_src),
-                extra_incs,
-            });
-            new_c_checked += 1;
+        } else if !built_only {
+            if let Some((sib_ocmd, cwd, abs_src)) = find_sibling_ocmd(ctx, f, &mut kbuild_cache) {
+                jobs.push(PreflightJob {
+                    label: format!("[NEW] {f}"),
+                    techpack: tp,
+                    ocmd: sib_ocmd,
+                    cwd,
+                    override_src: Some(abs_src),
+                    extra_incs,
+                });
+                new_c_checked += 1;
+            } else {
+                skipped_unbuilt += 1;
+            }
         } else {
             skipped_unbuilt += 1;
         }
@@ -531,12 +579,15 @@ pub fn cmd_preflight(
         dep_modules,
         skipped_unbuilt
     );
+    if kconfig_or_caps_changed {
+        println!("  note: Kconfig/cpucaps changed since last KERNEL_OBJ build — stale autoconf.h/cpucap-defs.h may flag renamed CONFIG_*/ARM64_* macros until next make");
+    }
     if jobs.is_empty() {
         println!("  nothing to check (no built .o.cmd matched)");
         return if guard_failed { 1 } else { 0 };
     }
 
-    let tmp_dir = ctx.ws_root.join("lab/ktool/.preflight-tmp");
+    let tmp_dir = std::env::temp_dir().join(format!("kawal-preflight-{}", std::process::id()));
     if link_check {
         let _ = fs::remove_dir_all(&tmp_dir);
         let _ = fs::create_dir_all(&tmp_dir);
@@ -565,27 +616,31 @@ pub fn cmd_preflight(
         (idx, rc, err, obj_path)
     });
 
-    let mut failed = Vec::new();
+    let mut built_failed = Vec::new();
+    let mut new_failed = Vec::new();
+    let built_total = jobs.len().saturating_sub(new_c_checked);
     for (idx, rc, err, _) in &results {
         if *rc != 0 {
-            failed.push((&jobs[*idx].label, err.as_str()));
+            if jobs[*idx].override_src.is_some() {
+                new_failed.push((&jobs[*idx].label, err.as_str()));
+            } else {
+                built_failed.push((&jobs[*idx].label, err.as_str()));
+            }
         }
     }
 
     let mut compile_ok = true;
-    if failed.is_empty() {
+    if built_failed.is_empty() {
         println!(
-            "  PASS: all {} translation units compiled cleanly (0 C errors!)",
-            jobs.len()
+            "  PASS [BUILT]: all {built_total} real built translation unit(s) compiled cleanly (0 C errors!)"
         );
     } else {
         compile_ok = false;
         println!(
-            "  !! FAIL: {}/{} translation unit(s) have compile errors:",
-            failed.len(),
-            jobs.len()
+            "  !! FAIL [BUILT]: {}/{built_total} real built translation unit(s) have compile errors:",
+            built_failed.len()
         );
-        for (label, err) in &failed {
+        for (label, err) in &built_failed {
             println!("\n  --- {label} ---");
             for ln in err
                 .lines()
@@ -594,6 +649,47 @@ pub fn cmd_preflight(
             {
                 println!("    {ln}");
             }
+        }
+    }
+
+    if !new_failed.is_empty() {
+        // Explicit-file invocations on a [NEW] file should still report & fail so single-file checks work.
+        if !explicit_files.is_empty() && built_total == 0 {
+            compile_ok = false;
+        }
+        if show_new || (!explicit_files.is_empty() && built_total == 0) {
+            println!(
+                "\n  [NEW-SIBLING] {}/{} speculative unbuilt .c check(s) failed:",
+                new_failed.len(),
+                new_c_checked
+            );
+            for (label, err) in &new_failed {
+                println!("\n  --- {label} ---");
+                for ln in err
+                    .lines()
+                    .filter(|l| l.contains("error:") || l.contains("fatal error:") || l.contains("note:"))
+                    .take(8)
+                {
+                    println!("    {ln}");
+                }
+            }
+        } else {
+            let sample: Vec<&str> = new_failed
+                .iter()
+                .take(6)
+                .map(|(l, _)| l.trim_start_matches("[NEW] "))
+                .collect();
+            let extra = if new_failed.len() > 6 {
+                format!(" (+{} more)", new_failed.len() - 6)
+            } else {
+                String::new()
+            };
+            println!(
+                "  WARN [NEW-SIBLING]: {}/{} speculative unbuilt .c checks failed (collapsed: {}{extra}; pass --show-new to expand)",
+                new_failed.len(),
+                new_c_checked,
+                sample.join(", ")
+            );
         }
     }
 

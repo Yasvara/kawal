@@ -66,7 +66,7 @@ pub fn find_ro_sandbox_write(line: &str) -> Option<String> {
                     j += 1;
                 }
                 let target = trim[start..j].trim_matches(|c| c == '"' || c == '\'');
-                if target.is_empty() {
+                if target.is_empty() || target.chars().all(|c| c.is_ascii_digit()) {
                     i = j;
                     continue;
                 }
@@ -215,7 +215,7 @@ fn is_unrelated_soc_or_test_c(cpath: &str) -> bool {
 /// 5-gate build-system, Android RO-sandbox, Bazel-vs-Kbuild, UAPI & Soong Android.bp verifier!
 /// Designed to catch 100% of build-system failures in <1s BEFORE spending 13m on `./build.sh`.
 pub fn cmd_build_guard(ctx: &Ctx, base: Option<&str>, head: &str) -> i32 {
-    println!("=== ktool build-guard (RO-sandbox, Bazel-vs-Kbuild, UAPI, Soong Android.bp, exec-mode) ===");
+    println!("=== kawal build-guard (RO-sandbox, Bazel-vs-Kbuild, UAPI, Soong Android.bp, exec-mode) ===");
     let mut issues = 0usize;
 
     let changed_files: Vec<String> = if let Some(b) = base {
@@ -266,6 +266,15 @@ pub fn cmd_build_guard(ctx: &Ctx, base: Option<&str>, head: &str) -> i32 {
     }
     let mut ro_hits = Vec::new();
     for mk in &mk_files {
+        // Core Kbuild Makefiles run inside $(objtree), and tools/ non-arm64 Makefiles are not built by Android nsjail
+        if ctx.is_default_kernel
+            && (mk == "Makefile"
+                || mk.starts_with("tools/")
+                || mk.starts_with("scripts/")
+                || (mk.starts_with("arch/") && !mk.starts_with("arch/arm64/")))
+        {
+            continue;
+        }
         let Ok(txt) = fs::read_to_string(ctx.repo.join(mk)) else { continue };
         for (idx, ln) in txt.lines().enumerate() {
             if let Some(tgt) = find_ro_sandbox_write(ln) {
@@ -435,6 +444,7 @@ mod tests {
         assert_eq!(find_ro_sandbox_write("\techo ok > /dev/null 2>&1"), None);
         assert_eq!(find_ro_sandbox_write("\techo ok > $(obj)/gen.h"), None);
         assert_eq!(find_ro_sandbox_write("# comment > foo"), None);
+        assert_eq!(find_ro_sandbox_write("\t((c) > 255 ? 255 : (c))"), None);
     }
 
     #[test]

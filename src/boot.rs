@@ -29,6 +29,7 @@ const TIER0_PREFIXES: &[&str] = &[
     "drivers/regulator/",
     "drivers/spmi/",
     "drivers/firmware/qcom_scm",
+    "drivers/firmware/qcom/",
     "drivers/iommu/",
     "drivers/thermal/qcom/tsens",
     "drivers/base/power/",
@@ -434,7 +435,7 @@ fn check_exports_and_hooks(ctx: &Ctx, base: &str, head: &str) -> (Vec<String>, V
         .filter(|s| !add_exports.contains(*s))
         .cloned()
         .collect();
-    if !lost_exports.is_empty() && ctx.is_default_kernel && ctx.modules.is_dir() {
+    if !lost_exports.is_empty() {
         // Verify they aren't still exported elsewhere in kernel
         let pat_exp = format!(r"EXPORT_SYMBOL[A-Z_]*\(\s*({})\b", lost_exports.join("|"));
         let (_, still_out) = rg(&ctx.repo, &["-o", "--no-filename", "-g", "*.c", "-g", "*.h", &pat_exp]);
@@ -443,18 +444,41 @@ fn check_exports_and_hooks(ctx: &Ctx, base: &str, head: &str) -> (Vec<String>, V
 
         if !gone.is_empty() {
             let pat_use = format!(r"\b({})\s*\(", gone.join("|"));
-            let (_, mout) = rg(&ctx.modules, &["-n", "-g", "*.c", "-g", "*.h", &pat_use]);
             let mut by_sym: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for ln in mout.lines() {
-                let p: Vec<&str> = ln.splitn(3, ':').collect();
-                if p.len() == 3 {
-                    for c in extract_calls(strip_c_comments(p[2]), 3) {
-                        if gone.iter().any(|g| g == &c) {
-                            by_sym.entry(c).or_default().push(format!("modules/{}:{}", p[0], p[1]));
+
+            // 1. Check out-of-tree sm8735-modules
+            if ctx.is_default_kernel && ctx.modules.is_dir() {
+                let (_, mout) = rg(&ctx.modules, &["-n", "-g", "*.c", "-g", "*.h", &pat_use]);
+                for ln in mout.lines() {
+                    let p: Vec<&str> = ln.splitn(3, ':').collect();
+                    if p.len() == 3 {
+                        for c in extract_calls(strip_c_comments(p[2]), 3) {
+                            if gone.iter().any(|g| g == &c) {
+                                by_sym.entry(c).or_default().push(format!("modules/{}:{}", p[0], p[1]));
+                            }
                         }
                     }
                 }
             }
+
+            // 2. Check in-tree kernel modules & Rust drivers (e.g. rust_binder.ko -> security_binder_*)
+            let (_, kout) = rg(
+                &ctx.repo,
+                &["-n", "-g", "*.c", "-g", "*.rs", &pat_use, "drivers", "rust"],
+            );
+            for ln in kout.lines() {
+                let p: Vec<&str> = ln.splitn(3, ':').collect();
+                if p.len() == 3 && (p[0].ends_with(".rs") || is_built_file(ctx, p[0])) {
+                    let code = strip_c_comments(p[2]);
+                    for sym in &gone {
+                        let from_f = rm_exports.get(sym).map(|s| s.as_str()).unwrap_or("");
+                        if p[0] != from_f && word_in_text(code, sym) && code.contains(&format!("{sym}(")) {
+                            by_sym.entry(sym.clone()).or_default().push(format!("{}:{}", p[0], p[1]));
+                        }
+                    }
+                }
+            }
+
             for (sym, locs) in by_sym {
                 let from_f = rm_exports.get(&sym).map(|s| s.as_str()).unwrap_or("?");
                 export_hits.push(format!(
